@@ -8,7 +8,7 @@ authenticating **once** per batch. Single file, Python ≥ 3.6, **standard libra
 
 ```bash
 # from a controller, over ssh (script is streamed over ssh stdin; nothing is written on the target)
-./newrole_batch.py ssh user@host --ssh-opt=-i --ssh-opt=~/.ssh/id_rsa \
+./newrole_batch.py ssh user@host --ssh-key ~/.ssh/id_rsa \
     --password-file ./pw -r sysadm_r \
     -c 'id -Z' -c 'systemctl status sshd' --commands-file cmds.txt --script setup.sh --json
 
@@ -19,14 +19,15 @@ authenticating **once** per batch. Single file, Python ≥ 3.6, **standard libra
 | option | meaning |
 |---|---|
 | `-r/-t/-l` | role / type / MLS level passed to `newrole` |
-| `-c CMD` (repeatable), `--commands-file F` (one per line), `--script F` (whole file = one command) | what to run |
+| `-c CMD` (repeatable), `--commands-file F` (one per line), `--script F` (whole file = one command) | what to run, in command-line order |
+| `--ssh-key F`, `--ssh-opt=X` (repeatable; use the `=` form for values starting with `-`) | ssh login key / extra ssh arguments |
 | `--isolate` | each command in a subshell (default: one persistent shell, so `cd`/vars carry over) |
 | `--stop-on-error`, `--timeout S`, `--json` | control / output |
 | `--password-file F` (must be 0600, yours) / `--password-fd N` / `--password-stdin` / tty prompt | password sources. **Never argv or env.** |
 | `--audit none\|hash\|full` | syslog(authpriv) record of commands; default logs a sha256 prefix only |
 | `--remote-path P` | use a pre-installed copy on the target instead of streaming |
 
-Exit codes: `0` ok · `1` a command returned non-zero · `2` usage · `3` auth/context failure ·
+Exit codes: `0` ok · `1` a command returned non-zero · `2` usage (bad options, missing/unsafe password or command file) · `3` auth/context failure ·
 `4` session/connection died (including ssh failing before login) · `5` timeout · `130` interrupted (Ctrl-C;
 the session is closed cleanly).
 
@@ -86,8 +87,9 @@ level (close it, or exit its `with` block, before opening another at that level)
   the elevated role, so review untrusted command files first and never build commands from untrusted input
   (shell injection). `--stop-on-error` is off by default: a failed step does not stop later ones.
 * **Output may contain secrets.** Command output goes to stdout/`--json`; redirecting it to files, CI logs or
-  tickets can leak whatever the commands print. `--audit full` also writes complete command text (including any
+  tickets can leak whatever the commands print. `--audit full` also writes complete command text (long commands are split over several syslog lines) (including any
   secrets you embedded in it) to syslog; the default logs only a hash prefix.
+* **`answers=` passwords** (e.g. for sudo) travel as ordinary Python strings and are not wiped.
 * **Host keys.** Over ssh, do not disable host key checking via `--ssh-opt`. Doing so lets a man-in-the-middle
   capture the password.
 * **`SSH_ASKPASS` in the test suite** exposes the password to a helper script for the duration of a test run;

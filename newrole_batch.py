@@ -97,6 +97,10 @@ class _Timeout(Exception):
     pass
 
 
+class UsageError(Exception):
+    """Bad invocation (missing file, unusable password source...): reported without a traceback."""
+
+
 def raise_event_error(ev):
     """Raise the exception matching an {"event": "error"} reply from a serve() peer."""
     exc = {"auth": AuthError, "context": ContextError, "timeout": CommandTimeout,
@@ -141,8 +145,11 @@ class Audit:
 
     def log(self, msg, prio=syslog.LOG_INFO):
         if self.enabled:
+            msg = msg.replace("\n", " ")
+            parts = [msg[i:i + 800] for i in range(0, len(msg), 800)] or [""]
             try:
-                syslog.syslog(prio, msg.replace("\n", " ")[:900])
+                for i, part in enumerate(parts, 1):
+                    syslog.syslog(prio, part if len(parts) == 1 else "[part %d/%d] %s" % (i, len(parts), part))
             except (OSError, ValueError):
                 pass
 
@@ -566,9 +573,11 @@ class NewroleSession:
                 if not text:
                     continue
                 try:
-                    return json.loads(text)
+                    obj = json.loads(text)
                 except ValueError:
                     continue      # stray ssh/bash banner line before the real JSON
+                if isinstance(obj, dict):
+                    return obj
             if deadline is not None and time.monotonic() > deadline:
                 raise NewroleError("timed out waiting for nested session")
             if not self._wait_readable(deadline):
@@ -778,6 +787,8 @@ class RemoteSession:
                                         # on it must not call start() again
 
     def start(self):
+        if self._started:
+            return self
         remote = remote_command(self.remote_python, self.remote_path)
         argv = [self.ssh, "-T"] + self.ssh_opts + ["--", self.host, remote]
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1047,11 +1058,18 @@ def serve():
 
 # ----------------------------------------------------------------------- CLI
 def read_password(a, role):
+    pw = _read_password(a, role)
+    if not pw:
+        raise UsageError("empty password (it would only cost a PAM failure)")
+    return pw
+
+
+def _read_password(a, role):
     if a.password_file:
         with open(a.password_file, "rb") as f:
             st = os.fstat(f.fileno())               # check the file we actually opened
             if st.st_uid != os.geteuid() or st.st_mode & 0o077:
-                sys.exit("password file must be owned by you with mode 0600/0400")
+                raise UsageError("password file must be owned by you with mode 0600/0400")
             return bytearray(f.readline().rstrip(b"\r\n"))
     if a.password_fd is not None:
         data = b""
@@ -1063,17 +1081,32 @@ def read_password(a, role):
         return bytearray(data.rstrip(b"\r\n"))
     if a.password_stdin:
         return bytearray(sys.stdin.buffer.readline().rstrip(b"\r\n"))
-    return bytearray(getpass.getpass("newrole password (role %s): " % role).encode())
+    try:
+        return bytearray(getpass.getpass("newrole password (role %s): " % role).encode())
+    except EOFError:
+        raise UsageError("no password source and no terminal to prompt on; "
+                         "use --password-file, --password-fd or --password-stdin")
+
+
+def _source(kind):
+    class Add(argparse.Action):
+        def __call__(self, parser, ns, values, option_string=None):
+            ns.sources.append((kind, values))
+    return Add
 
 
 def gather_commands(a):
-    cmds = list(a.command or [])
-    if a.commands_file:
-        with open(a.commands_file) as f:
-            cmds += [line.rstrip("\n") for line in f if line.strip() and not line.lstrip().startswith("#")]
-    if a.script:
-        with open(a.script) as f:
-            cmds.append(f.read())
+    """Commands in the order the options were given on the command line."""
+    cmds = []
+    for kind, value in a.sources:
+        if kind == "c":
+            cmds.append(value)
+        elif kind == "f":
+            with open(value) as f:
+                cmds += [line.rstrip("\n") for line in f if line.strip() and not line.lstrip().startswith("#")]
+        else:
+            with open(value) as f:
+                cmds.append(f.read())
     return cmds
 
 
@@ -1110,9 +1143,12 @@ def main(argv=None):
     common.add_argument("-r", "--role", required=True)
     common.add_argument("-t", "--type")
     common.add_argument("-l", "--level")
-    common.add_argument("-c", "--command", action="append", help="command to run (repeatable)")
-    common.add_argument("--commands-file", help="one command per line (# comments ok)")
-    common.add_argument("--script", help="whole file executed as ONE command")
+    common.set_defaults(sources=[])
+    common.add_argument("-c", "--command", action=_source("c"), metavar="CMD",
+                        help="command to run (repeatable; all sources run in command-line order)")
+    common.add_argument("--commands-file", action=_source("f"), metavar="FILE",
+                        help="one command per line (# comments ok)")
+    common.add_argument("--script", action=_source("s"), metavar="FILE", help="whole file executed as ONE command")
     common.add_argument("--isolate", action="store_true", help="run each command in a subshell (no state leaks)")
     common.add_argument("--stop-on-error", action="store_true")
     common.add_argument("--timeout", type=float, help="per-command seconds (a timeout ends the session)")
@@ -1130,7 +1166,9 @@ def main(argv=None):
     s = sub.add_parser("ssh", parents=[common])
     s.add_argument("host", help="[user@]host")
     s.add_argument("--ssh", default="ssh")
-    s.add_argument("--ssh-opt", action="append", default=[], help="extra ssh argument (repeatable), e.g. -i")
+    s.add_argument("--ssh-key", metavar="FILE", help="private key for the ssh login (same as -i FILE)")
+    s.add_argument("--ssh-opt", action="append", default=[],
+                   help="extra ssh argument (repeatable); write --ssh-opt=VALUE for values starting with '-'")
     s.add_argument("--remote-python", default="python3")
     s.add_argument("--remote-path", help="use a pre-installed copy instead of streaming this file")
     p.add_argument("--version", action="version", version=VERSION)
@@ -1140,11 +1178,20 @@ def main(argv=None):
         return EXIT_USAGE
     if a.mode == "serve":
         return serve()
-    cmds = gather_commands(a)
-    if not cmds:
-        sys.stderr.write("no commands given (-c / --commands-file / --script)\n")
+    try:
+        cmds = gather_commands(a)
+        if not cmds:
+            raise UsageError("no commands given (-c / --commands-file / --script)")
+        pw_ba = read_password(a, a.role)
+    except UsageError as e:
+        sys.stderr.write("newrole-batch: %s\n" % e)
         return EXIT_USAGE
-    pw_ba = read_password(a, a.role)
+    except OSError as e:
+        sys.stderr.write("newrole-batch: %s: %s\n" % (e.filename, e.strerror))
+        return EXIT_USAGE
+    except KeyboardInterrupt:
+        sys.stderr.write("\nnewrole-batch: interrupted\n")
+        return EXIT_INTERRUPT
     cfg = {"role": a.role, "type": a.type, "level": a.level, "audit": a.audit,
            "syslog": not a.no_syslog, "auth_timeout": a.auth_timeout, "max_output": a.max_output}
     try:
@@ -1152,7 +1199,8 @@ def main(argv=None):
             sess = NewroleSession(a.role, pw_ba, a.type, a.level, auth_timeout=a.auth_timeout,
                                   max_output=a.max_output, audit=Audit(a.audit, not a.no_syslog))
         else:
-            sess = RemoteSession(a.host, cfg, pw_ba, a.ssh, a.ssh_opt, a.remote_python, a.remote_path)
+            ssh_opts = (["-i", a.ssh_key] if a.ssh_key else []) + a.ssh_opt
+            sess = RemoteSession(a.host, cfg, pw_ba, a.ssh, ssh_opts, a.remote_python, a.remote_path)
         with sess:
             return batch(sess, cmds, a)
     except (AuthError, ContextError) as e:

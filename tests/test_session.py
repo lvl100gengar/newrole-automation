@@ -140,10 +140,40 @@ def test_password_file_must_be_private(tmp_path):
     f.write_text("secret\n")
     f.chmod(0o644)
     args = type("A", (), {"password_file": str(f), "password_fd": None, "password_stdin": False})()
-    with pytest.raises(SystemExit):
+    with pytest.raises(nb.UsageError):
         nb.read_password(args, "r_r")
     f.chmod(0o600)
     assert nb.read_password(args, "r_r") == bytearray(b"secret")
+    f.write_text("\n")
+    with pytest.raises(nb.UsageError, match="empty"):
+        nb.read_password(args, "r_r")
+
+
+def test_cli_usage_errors_exit_2_without_traceback(tmp_path, capsys):
+    pw = tmp_path / "pw"
+    pw.write_text("x\n")
+    pw.chmod(0o600)
+    base = ["local", "-r", "r_r", "--password-file", str(pw)]
+    assert nb.main(base + ["--commands-file", str(tmp_path / "nope")]) == nb.EXIT_USAGE
+    assert "nope" in capsys.readouterr().err
+    assert nb.main(["local", "-r", "r_r", "-c", "id", "--password-file", str(tmp_path / "nope")]) == nb.EXIT_USAGE
+    assert nb.main(["local", "-r", "r_r"]) == nb.EXIT_USAGE
+
+
+def test_commands_keep_command_line_order(tmp_path):
+    cf, sf = tmp_path / "cmds", tmp_path / "s.sh"
+    cf.write_text("# c\nb\n")
+    sf.write_text("d\n")
+    a = nb.argparse.Namespace(sources=[("c", "a"), ("f", str(cf)), ("c", "c"), ("s", str(sf))])
+    assert nb.gather_commands(a) == ["a", "b", "c", "d\n"]
+
+
+def test_audit_splits_long_messages(monkeypatch):
+    seen = []
+    monkeypatch.setattr(nb.syslog, "syslog", lambda prio, m: seen.append(m))
+    nb.Audit("full", True).log("x" * 2000)
+    assert len(seen) == 3 and seen[0].startswith("[part 1/3]")
+    assert sum(m.count("x") for m in seen) == 2000
 
 
 def test_remote_command_is_quoted():

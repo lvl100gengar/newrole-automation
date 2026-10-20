@@ -51,9 +51,11 @@ import time
 VERSION = "1.0.0"
 
 EXIT_OK, EXIT_CMDFAIL, EXIT_USAGE, EXIT_AUTH, EXIT_SESSION, EXIT_TIMEOUT = 0, 1, 2, 3, 4, 5
+EXIT_INTERRUPT = 130              # 128 + SIGINT, as a shell reports a Ctrl-C'd program
 
 NEWROLE = "/usr/bin/newrole"
 SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+REPLY_GRACE = 15.0                # extra seconds RemoteSession waits beyond a command's own timeout
 CHUNK = 2400                      # b64 chars per tty line (tty canonical limit is 4095)
 PROMPT_RE = re.compile(rb"[Pp]assword[^\r\n]{0,40}: ?$")
 
@@ -781,16 +783,21 @@ class RemoteSession:
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      env=dict(os.environ, **self.ssh_env) if self.ssh_env else None)
         w = self.proc.stdin
-        if not self.remote_path:
-            with open(os.path.realpath(__file__), "rb") as f:
-                w.write(base64.b64encode(f.read()) + b"\n")
-        w.write(json.dumps(self.cfg).encode() + b"\n")
         line = self.password + b"\n"
-        w.write(line)
-        w.flush()
-        wipe(line)
-        wipe(self.password)
         try:
+            try:
+                if not self.remote_path:
+                    with open(os.path.realpath(__file__), "rb") as f:
+                        w.write(base64.b64encode(f.read()) + b"\n")
+                w.write(json.dumps(self.cfg).encode() + b"\n")
+                w.write(line)
+                w.flush()
+            except OSError:                 # ssh already exited (refused, unreachable, bad key...)
+                raise SessionDead("ssh exited (status %s) before login; see its message above"
+                                  % self._finish())
+            finally:
+                wipe(line)
+                wipe(self.password)
             ev = self._read(time.monotonic() + self.cfg.get("auth_timeout", 30.0) + 30.0)
             if ev.get("event") == "error":
                 raise_event_error(ev)
@@ -835,15 +842,22 @@ class RemoteSession:
             raise NewroleError("garbled reply from remote: %r" % line[:200])
 
     def run(self, cmd, timeout=None, isolate=False, stderr=False, answers=None):
+        if self.proc is None or self.proc.poll() is not None:
+            raise SessionDead("session not started or already terminated")
         req = {"cmd": cmd, "timeout": timeout, "isolate": isolate, "stderr": stderr,
                "answers": [[r, pw if isinstance(pw, str) else pw.decode()] for r, pw in (answers or [])]}
         try:
             self.proc.stdin.write(json.dumps(req).encode() + b"\n")
             self.proc.stdin.flush()
-        except (BrokenPipeError, OSError):
+        except (OSError, ValueError):
             raise SessionDead("remote connection lost")
         # the remote enforces `timeout` itself; this is only a backstop for a hung connection
-        r = self._read(time.monotonic() + timeout + 15 if timeout else None)
+        try:
+            r = self._read(time.monotonic() + timeout + REPLY_GRACE if timeout else None)
+        except CommandTimeout:
+            # the late reply would otherwise be taken for the answer to the next command
+            self._finish()
+            raise
         if r.get("event") == "error":
             raise_event_error(r)
         return r
@@ -1147,6 +1161,9 @@ def main(argv=None):
     except NewroleError as e:
         sys.stderr.write("newrole-batch: %s\n" % e)
         return EXIT_SESSION
+    except KeyboardInterrupt:               # `with sess` has already closed the session
+        sys.stderr.write("newrole-batch: interrupted\n")
+        return EXIT_INTERRUPT
     finally:
         wipe(pw_ba)
 

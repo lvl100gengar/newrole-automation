@@ -9,8 +9,10 @@ Tests taking `backend` run on every enabled backend; tests taking `real` need a 
 tests using `make_session("fake")` / `fake_*` only make sense offline.
 """
 import os
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -147,6 +149,68 @@ def test_password_file_must_be_private(tmp_path):
 def test_remote_command_is_quoted():
     assert nb.remote_command("python3", "/a b/x.py") == "python3 '/a b/x.py' serve"
     assert "'; rm" not in nb.remote_command("python3", None)
+
+
+def fake_ssh(tmp_path, body):
+    path = tmp_path / "fakessh"
+    path.write_text("#!/bin/bash\n" + body)
+    path.chmod(0o700)
+    return str(path)
+
+
+READY = """echo '{"event": "ready", "context": "test:ctx"}'\n"""
+
+
+def test_ssh_exiting_before_login_is_session_dead_not_broken_pipe(tmp_path):
+    ssh = fake_ssh(tmp_path, "exit 255\n")
+    with pytest.raises(nb.SessionDead, match="before login"):
+        nb.RemoteSession("h", {"role": "r_r"}, bytearray(b"x"), ssh=ssh).start()
+
+
+def test_cli_ssh_failure_exits_4_without_traceback(tmp_path):
+    ssh = fake_ssh(tmp_path, "exit 255\n")
+    pw = tmp_path / "pw"
+    pw.write_text("x\n")
+    pw.chmod(0o600)
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "newrole_batch.py"), "ssh", "h", "--ssh", ssh,
+                        "--password-file", str(pw), "-r", "r_r", "-c", "id"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == nb.EXIT_SESSION
+    assert "Traceback" not in r.stderr and "before login" in r.stderr
+
+
+def test_remote_run_before_start_is_session_dead():
+    with pytest.raises(nb.SessionDead):
+        nb.RemoteSession("h", {"role": "r_r"}, bytearray(b"x")).run("id")
+
+
+def test_remote_backstop_timeout_kills_the_connection(tmp_path, monkeypatch):
+    """A reply that arrives after the backstop must not be read as the next command's answer."""
+    monkeypatch.setattr(nb, "REPLY_GRACE", 0.2)
+    ssh = fake_ssh(tmp_path, READY + """read -r _; read -r _; read -r _; sleep 1
+echo '{"rc": 0, "out": "late", "err": "", "truncated": false, "duration": 0}'
+cat >/dev/null\n""")
+    s = nb.RemoteSession("h", {"role": "r_r"}, bytearray(b"x"), ssh=ssh, remote_path="/x").start()
+    with pytest.raises(nb.CommandTimeout):
+        s.run("first", timeout=0.1)
+    with pytest.raises(nb.SessionDead):
+        s.run("second")
+    s.close()
+
+
+def test_cli_ctrl_c_exits_130_cleanly(tmp_path):
+    ssh = fake_ssh(tmp_path, READY + "cat >/dev/null\n")        # ready, then never answers
+    pw = tmp_path / "pw"
+    pw.write_text("x\n")
+    pw.chmod(0o600)
+    p = subprocess.Popen([sys.executable, os.path.join(ROOT, "newrole_batch.py"), "ssh", "h", "--ssh", ssh,
+                          "--password-file", str(pw), "-r", "r_r", "-c", "sleep 100"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    time.sleep(2)
+    p.send_signal(signal.SIGINT)
+    _out, err = p.communicate(timeout=30)
+    assert p.returncode == nb.EXIT_INTERRUPT
+    assert "Traceback" not in err and "interrupted" in err
 
 
 # ------------------------------------------------------------------- real host only

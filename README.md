@@ -27,7 +27,8 @@ authenticating **once** per batch. Single file, Python ≥ 3.6, **standard libra
 | `--remote-path P` | use a pre-installed copy on the target instead of streaming |
 
 Exit codes: `0` ok · `1` a command returned non-zero · `2` usage · `3` auth/context failure ·
-`4` session/connection died · `5` timeout.
+`4` session/connection died (including ssh failing before login) · `5` timeout · `130` interrupted (Ctrl-C;
+the session is closed cleanly).
 
 Python example (`examples/example.py`): ssh login with a password or key, output, separate stdout/stderr,
 and a command that needs a second password (`sudo`) answered automatically:
@@ -71,6 +72,31 @@ level (close it, or exit its `with` block, before opening another at that level)
   stdin. Process sets `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, umask 077, wipes its `bytearray` copy. Python can't guarantee zeroisation of every transient copy.
 * `newrole` is invoked by absolute path, checked root-owned/not writable, with a scrubbed environment.
 * Shell is non-interactive (`bash --noprofile --norc /dev/stdin`): no profile, `TMOUT`, history or prompt.
+
+## Security warnings / responsible use
+
+* **Authorized use only.** This tool types a real account's password into `newrole`/PAM prompts. Use it only on
+  systems and accounts you are authorized to administer. It does not bypass authentication, it is not a
+  password-guessing tool, and it deliberately never retries a failed password.
+* **You are handing it a credential.** Anything that can read the process (same uid, root, a debugger) or the
+  password file can read the password. Keep `--password-file` 0600 on an encrypted disk, never commit it, and
+  delete it when finished. Prefer a short-lived or dedicated account. The "no copies in memory" and wiping
+  measures are best-effort only.
+* **Commands are run with your privileges.** Whatever you pass to `-c`, `--commands-file` or `--script` runs in
+  the elevated role, so review untrusted command files first and never build commands from untrusted input
+  (shell injection). `--stop-on-error` is off by default: a failed step does not stop later ones.
+* **Output may contain secrets.** Command output goes to stdout/`--json`; redirecting it to files, CI logs or
+  tickets can leak whatever the commands print. `--audit full` also writes complete command text (including any
+  secrets you embedded in it) to syslog; the default logs only a hash prefix.
+* **Host keys.** Over ssh, do not disable host key checking via `--ssh-opt`. Doing so lets a man-in-the-middle
+  capture the password.
+* **`SSH_ASKPASS` in the test suite** exposes the password to a helper script for the duration of a test run;
+  only use the real-host tests against hosts and accounts you own, and note that the wrong-password tests
+  count towards `pam_faillock` and can lock the account.
+* **Not independently audited.** Treat the security properties above as design intent, not a guarantee, and
+  review the code before using it in a sensitive environment. Report vulnerabilities privately to the
+  maintainer rather than in a public issue.
+* Provided "as is", without warranty; you are responsible for complying with your organisation's policies.
 
 ## Limits (by design)
 

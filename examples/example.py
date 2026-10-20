@@ -13,14 +13,18 @@ Usage:
         --nest-host user@B --nest-key /path/to/key/as/found/on/A
 
 --nest-key is a path *on host A* (the nested ssh runs inside A's own shell, so it needs a
-key A can already reach, e.g. one A uses to manage downstream hosts) -- omit it to use
---nest-password-is-same (password auth for the inner hop instead, if A allows it).
+key A can already reach, e.g. one A uses to manage downstream hosts). Omit it to use password
+auth for the inner hop instead: the demo then drops a short-lived askpass helper (holding the
+password, mode 0700) into a temp dir under $HOME on A, because ssh on A prompts on A's tty
+and the nested handshake would otherwise be typed into that prompt. It is removed afterwards.
 
 The same password is used for ssh (if no --key), for newrole, and for sudo in this demo.
 Requires only newrole_batch.py (one directory up) and the stock ssh client.
 """
 import argparse
+import base64
 import os
+import shlex
 import sys
 
 # SSH_ASKPASS support: ssh runs *this script* to ask for the ssh password; we answer from the
@@ -31,6 +35,25 @@ if os.environ.get("NRB_ASKPASS_MODE"):
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from newrole_batch import RemoteSession, NewroleError, AuthError  # noqa: E402
+
+
+def make_askpass_ssh(sess, password):
+    """On host A (inside the role shell) create an ssh wrapper that answers ssh's password
+    prompt via SSH_ASKPASS. Returns (temp_dir, wrapper_path). $HOME is used because /tmp is
+    often noexec; chcon gives the helpers a type the confined ssh may execute (best effort)."""
+    r = sess.run('umask 077; mktemp -d -p "$HOME" nrb-askpass.XXXXXX')
+    if r["rc"]:
+        raise NewroleError("cannot create helper dir on host: %s" % r["out"].strip())
+    d = r["out"].strip()
+    files = {
+        "ap": "#!/bin/sh\nprintf '%%s\\n' %s\n" % shlex.quote(password),
+        "ssh": "#!/bin/sh\nexec setsid env SSH_ASKPASS=%s/ap DISPLAY=none ssh \"$@\"\n" % d,
+    }
+    cmds = ["echo %s | base64 -d > %s/%s" % (base64.b64encode(t.encode()).decode(), d, n)
+            for n, t in files.items()]
+    cmds += ["chmod 700 %s/ap %s/ssh" % (d, d), "chcon -t bin_t %s/ap %s/ssh 2>/dev/null; true" % (d, d)]
+    sess.run("; ".join(cmds))
+    return d, d + "/ssh"
 
 
 def main():
@@ -83,17 +106,27 @@ def main():
             #    it by hand at A's prompt. sess.nest() does the ssh + password handshake once
             #    and returns a session with the exact same run() interface.
             if a.nest_host:
+                helper_dir = None
                 nest_opts = ["-oLogLevel=ERROR", "-oBatchMode=yes"]
+                nest_ssh = "ssh"
                 if a.nest_key:
                     nest_opts += ["-i", a.nest_key, "-oIdentitiesOnly=yes"]
-                with sess.nest(a.nest_host, {"role": a.role}, bytearray(password.encode()),
-                               ssh_opts=nest_opts) as nested:
-                    print("\n[4] nested into %s, context: %s" % (a.nest_host, nested.context))
-                    r = nested.run("id -Z; hostname")
-                    print("    on B: rc=%d output:\n%s" % (r["rc"], r["out"]))
-                # back on A automatically once the `with` block above closes B's session
-                r = sess.run("echo back on A; hostname")
-                print("    back on A: rc=%d output:\n%s" % (r["rc"], r["out"]))
+                else:                       # password auth for the inner hop, via a temp askpass
+                    helper_dir, nest_ssh = make_askpass_ssh(sess, password)
+                    nest_opts = ["-oLogLevel=ERROR", "-oPubkeyAuthentication=no",
+                                 "-oNumberOfPasswordPrompts=1"]
+                try:
+                    with sess.nest(a.nest_host, {"role": a.role}, bytearray(password.encode()),
+                                   ssh=nest_ssh, ssh_opts=nest_opts) as nested:
+                        print("\n[4] nested into %s, context: %s" % (a.nest_host, nested.context))
+                        r = nested.run("id -Z; hostname")
+                        print("    on B: rc=%d output:\n%s" % (r["rc"], r["out"]))
+                    # back on A automatically once the `with` block above closes B's session
+                    r = sess.run("echo back on A; hostname")
+                    print("    back on A: rc=%d output:\n%s" % (r["rc"], r["out"]))
+                finally:
+                    if helper_dir:
+                        sess.run("rm -rf %s" % shlex.quote(helper_dir))
     except AuthError as e:
         sys.exit("login failed (wrong password / role not allowed): %s" % e)
     except NewroleError as e:

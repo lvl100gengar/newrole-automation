@@ -83,8 +83,31 @@ class SessionDead(NewroleError):
         self.partial = partial
 
 
+class CommandTimeout(NewroleError):
+    pass
+
+
+class NestEnded(NewroleError):
+    """The nested ssh job already finished (its completion marker was consumed), so the pty
+    is back in its normal settings and there is nothing left to abort or drain."""
+
+
 class _Timeout(Exception):
     pass
+
+
+def raise_event_error(ev):
+    """Raise the exception matching an {"event": "error"} reply from a serve() peer."""
+    exc = {"auth": AuthError, "context": ContextError, "timeout": CommandTimeout}.get(
+        ev.get("kind"), NewroleError)
+    raise exc(ev.get("message"))
+
+
+def remote_command(python, path):
+    """Shell text run by ssh on the target to start serve(); both parts are quoted."""
+    if path:
+        return "%s %s serve" % (shlex.quote(python), shlex.quote(path))
+    return "%s -c %s serve" % (shlex.quote(python), shlex.quote(SERVE_BOOT))
 
 
 def harden_process():
@@ -180,40 +203,45 @@ class NewroleSession(object):
         fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
         try:
             self._authenticate()
+            self.alive = True                       # run_raw() needs it for the context check
             self._verify_context()
         except BaseException:
             self.close(force=True)
             raise
-        self.alive = True
         return self
 
     def _check_newrole(self):
-        st = os.stat(self.newrole)
+        try:
+            st = os.stat(self.newrole)
+        except OSError as e:
+            raise NewroleError("cannot use %s: %s" % (self.newrole, e))
         if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
             raise NewroleError("%s is not root-owned / is group-or-world writable" % self.newrole)
 
     def _authenticate(self):
-        deadline = time.time() + self.auth_timeout
-        sent = False
+        deadline = time.monotonic() + self.auth_timeout
         try:
-            while not sent:
-                self._expect_prompt(deadline)
-                sent = True
+            self._expect_prompt(deadline)
             self.buf.clear()
             self._write(bytes(self.password) + b"\n")
             wipe(self.password)
-            # Shell may still be starting (PAM delay, relabel): keep poking with an
-            # idempotent sync until it answers, bailing on exit or a re-prompt.
+            # The frame is queued in the tty until the shell starts reading. Resend rarely, and
+            # never while a password prompt is showing: a re-prompt (failed PAM conversation)
+            # would swallow the frame as a second password guess and count against faillock.
+            self._write(self._frame_cmd("true", "S1"))
+            next_send = time.monotonic() + 5.0
             while True:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     raise AuthError("timed out waiting for shell after password")
-                self._write(self._frame_cmd("true", "S1"))
                 try:
-                    self._collect("S1", min(deadline, time.time() + 1.0))
+                    self._collect("S1", min(deadline, time.monotonic() + 1.0))
                     break
                 except _Timeout:
-                    if PROMPT_RE.search(bytes(self.buf)):
+                    if PROMPT_RE.search(self.buf):
                         raise AuthError("newrole re-prompted for a password (wrong password?)")
+                    if time.monotonic() >= next_send:
+                        self._write(self._frame_cmd("true", "S1"))
+                        next_send = time.monotonic() + 5.0
             # second, fresh sync: discard duplicates from the resends above
             self._write(self._frame_cmd("true", "S2"))
             self._collect("S2", deadline)
@@ -270,7 +298,7 @@ class NewroleSession(object):
             self.audit.log("end role=%s commands=%d" % (self.role, self.n))
 
     def _reap(self, timeout):
-        end = time.time() + timeout
+        end = time.monotonic() + timeout
         while self.pid and self.exit_status is None:
             try:
                 p, st = os.waitpid(self.pid, os.WNOHANG)
@@ -280,7 +308,7 @@ class NewroleSession(object):
             if p:
                 self.exit_status = st
                 return
-            if time.time() > end:
+            if time.monotonic() > end:
                 return
             time.sleep(0.05)
 
@@ -309,11 +337,11 @@ class NewroleSession(object):
         return res
 
     def run_raw(self, cmd, timeout=None, isolate=False, stderr=False, answers=None):
-        if not self.alive and self.pid is None:
-            raise SessionDead("session not started")
+        if not self.alive:
+            raise SessionDead("session not started or already terminated")
         self._seq += 1
         name = "C%d" % self._seq
-        t0 = time.time()
+        t0 = time.monotonic()
         self._write(self._frame_cmd(cmd, name, isolate, stderr))
         deadline = t0 + timeout if timeout else None
         try:
@@ -324,7 +352,7 @@ class NewroleSession(object):
                 os.write(self.fd, b"\x03")
             except OSError:
                 pass
-            raise NewroleError("timeout after %ss (session terminated)" % timeout)
+            raise CommandTimeout("timeout after %ss (session terminated)" % timeout)
         except SessionDead as e:
             self.alive = False
             st = self.exit_status
@@ -356,11 +384,11 @@ class NewroleSession(object):
 
     def _wait_readable(self, deadline):
         while True:
-            t = 1.0 if deadline is None else max(0.0, min(1.0, deadline - time.time()))
+            t = 1.0 if deadline is None else max(0.0, min(1.0, deadline - time.monotonic()))
             r, _, _ = select.select([self.fd], [], [], t)
             if r:
                 return True
-            if deadline is not None and time.time() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
 
     def _pump(self):
@@ -383,15 +411,19 @@ class NewroleSession(object):
             del self.buf[cap:len(self.buf) - 2048]
         return len(data)
 
-    def _write(self, data):
+    def _write(self, data, stall_timeout=30.0):
         off = 0
+        last_progress = time.monotonic()
         while off < len(data):
+            if time.monotonic() - last_progress > stall_timeout:
+                raise SessionDead("write to pty stalled for %ss" % stall_timeout, bytes(self.buf))
             r, w, _ = select.select([self.fd], [self.fd], [], 5.0)
             if r:
                 self._pump()
             if w:
                 try:
                     off += os.write(self.fd, data[off:off + 2048])
+                    last_progress = time.monotonic()
                 except BlockingIOError:
                     pass
                 except OSError as e:
@@ -411,9 +443,9 @@ class NewroleSession(object):
                 out = bytes(self.buf[:m.start()])
                 del self.buf[:m.end()]
                 return out, rc, err
-            if deadline is not None and time.time() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise _Timeout()
-            if self._wait_readable(min(deadline, time.time() + 1.0) if deadline else None):
+            if self._wait_readable(min(deadline, time.monotonic() + 1.0) if deadline else None):
                 n = self._pump()
                 for item in list(pending):
                     pm = item[0].search(self.buf, max(0, len(self.buf) - 1024))
@@ -453,11 +485,7 @@ class NewroleSession(object):
         as a foreground job of the current shell. Blocks until raw mode is confirmed active
         (so the caller can safely start writing handshake bytes next) and returns the marker
         nonce to watch for when that ssh job finishes."""
-        if remote_path:
-            remote_cmd = "%s %s serve" % (remote_python, remote_path)
-        else:
-            remote_cmd = "%s -c %s serve" % (remote_python, shlex.quote(SERVE_BOOT))
-        argv = [ssh, "-T"] + list(ssh_opts) + [host, remote_cmd]
+        argv = [ssh, "-T"] + list(ssh_opts) + ["--", host, remote_command(remote_python, remote_path)]
         cmdline = " ".join(shlex.quote(a) for a in argv)
         nonce = base64.b16encode(os.urandom(8)).decode().lower()
         # set +e: a nonzero ssh exit must never skip our completion marker, even if the
@@ -473,7 +501,7 @@ class NewroleSession(object):
         # Wait for the READY marker: confirms raw mode is active and we're about to exec ssh,
         # so nest_handshake()'s writes can never land on the ordinary canonical/echoing prompt.
         readypat = re.compile(re.escape(("NRBNESTREADY" + nonce).encode()) + rb"\r?\n")
-        deadline = time.time() + 10.0
+        deadline = time.monotonic() + 10.0
         while True:
             m = readypat.search(self.buf)
             if m:
@@ -505,7 +533,7 @@ class NewroleSession(object):
             if m:
                 msg = bytes(self.buf[:m.start()]).strip()
                 del self.buf[:m.end()]
-                raise NewroleError("nested connection ended before a reply arrived%s" %
+                raise NestEnded("nested connection ended before a reply arrived%s" %
                                    (": %s" % self._text(msg) if msg else ""))
             nl = self.buf.find(b"\n")
             if nl != -1:
@@ -518,17 +546,27 @@ class NewroleSession(object):
                     return json.loads(text)
                 except ValueError:
                     continue      # stray ssh/bash banner line before the real JSON
-            if deadline is not None and time.time() > deadline:
+            if deadline is not None and time.monotonic() > deadline:
                 raise NewroleError("timed out waiting for nested session")
             if not self._wait_readable(deadline):
                 raise NewroleError("timed out waiting for nested session")
             self._pump()
 
+    def nest_abort(self, nonce, timeout=10.0):
+        """Best-effort recovery after a failed nested handshake: ask the peer to close, wait for
+        the ssh job's completion marker (which restores the pty's cooked settings). If that never
+        arrives the pty is left raw, so the session is marked dead rather than reused."""
+        try:
+            self.nest_send({"op": "close"})
+            self.nest_drain(nonce, timeout)
+        except NewroleError:
+            self.alive = False
+
     def nest_drain(self, nonce, timeout):
         """Discard everything until the nested job's completion marker (used on error, or
         after sending it a close, when we don't care about anything it still prints)."""
         donepat = self._nest_donepat(nonce)
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         while True:
             m = donepat.search(self.buf)
             if m:
@@ -536,7 +574,7 @@ class NewroleSession(object):
                 return int(m.group(1))
             if len(self.buf) > 4096:
                 del self.buf[:len(self.buf) - 2048]
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 raise NewroleError("nested session did not close within %ss" % timeout)
             if not self._wait_readable(deadline):
                 raise NewroleError("nested session did not close within %ss" % timeout)
@@ -608,10 +646,10 @@ class NewroleSession(object):
                         keep = n
                         break
                 if keep and held_since is None:
-                    held_since = time.time()
+                    held_since = time.monotonic()
                 elif not keep:
                     held_since = None
-                if keep and held_since is not None and time.time() - held_since > 0.3:
+                if keep and held_since is not None and time.monotonic() - held_since > 0.3:
                     keep = 0
                     held_since = None
                 if len(buf) > keep:
@@ -647,16 +685,20 @@ class NestedSession(object):
                                            self.remote_python, self.remote_path)
         self.parent.nest_handshake(self.cfg, self.password, script_b64)
         try:
-            ev = self.parent.nest_read_event(self.nonce, time.time() + self.auth_timeout)
+            ev = self.parent.nest_read_event(self.nonce, time.monotonic() + self.auth_timeout)
+        except NestEnded:
+            raise
         except NewroleError:
+            self.parent.nest_abort(self.nonce)
             raise
         if ev.get("event") == "error":
             try:
                 self.parent.nest_drain(self.nonce, 10.0)
             except NewroleError:
-                pass
-            raise {"auth": AuthError, "context": ContextError}.get(ev.get("kind"), NewroleError)(ev.get("message"))
+                self.parent.alive = False
+            raise_event_error(ev)
         if ev.get("event") != "ready":
+            self.parent.nest_abort(self.nonce)
             raise NewroleError("unexpected first message from nested session: %r" % ev)
         self.context = ev.get("context")
         self._open = True
@@ -668,10 +710,10 @@ class NestedSession(object):
         req = {"cmd": cmd, "timeout": timeout, "isolate": isolate, "stderr": stderr,
                "answers": [[r, pw if isinstance(pw, str) else pw.decode()] for r, pw in (answers or [])]}
         self.parent.nest_send(req)
-        deadline = time.time() + (timeout + 10 if timeout else 3600)
+        deadline = time.monotonic() + (timeout + 10 if timeout else 3600)
         r = self.parent.nest_read_event(self.nonce, deadline)
         if r.get("event") == "error":
-            raise NewroleError(r.get("message"))
+            raise_event_error(r)
         return r
 
     def close(self):
@@ -704,6 +746,7 @@ class RemoteSession(object):
         self.host, self.cfg, self.password = host, cfg, password
         self.ssh, self.ssh_opts, self.remote_python, self.remote_path = ssh, list(ssh_opts), remote_python, remote_path
         self.proc = None
+        self._rbuf = bytearray()
         self.context = None
         self.ssh_env = ssh_env          # extra env for the ssh client only (e.g. SSH_ASKPASS)
         self._nested = False            # True for a session returned by .nest(): shares proc
@@ -713,11 +756,8 @@ class RemoteSession(object):
                                         # on it must not call start() again
 
     def start(self):
-        if self.remote_path:
-            remote = "%s %s serve" % (self.remote_python, self.remote_path)
-        else:
-            remote = "%s -c '%s' serve" % (self.remote_python, SERVE_BOOT)
-        argv = [self.ssh, "-T"] + self.ssh_opts + [self.host, remote]
+        remote = remote_command(self.remote_python, self.remote_path)
+        argv = [self.ssh, "-T"] + self.ssh_opts + ["--", self.host, remote]
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      env=dict(os.environ, **self.ssh_env) if self.ssh_env else None)
         w = self.proc.stdin
@@ -728,18 +768,41 @@ class RemoteSession(object):
         w.write(bytes(self.password) + b"\n")
         w.flush()
         wipe(self.password)
-        ev = self._read()
-        if ev.get("event") == "error":
+        try:
+            ev = self._read(time.monotonic() + self.cfg.get("auth_timeout", 30.0) + 30.0)
+            if ev.get("event") == "error":
+                raise_event_error(ev)
+            if ev.get("event") != "ready":
+                raise NewroleError("unexpected first message: %r" % ev)
+        except BaseException:
             self._finish()
-            raise {"auth": AuthError, "context": ContextError}.get(ev.get("kind"), NewroleError)(ev.get("message"))
-        if ev.get("event") != "ready":
-            raise NewroleError("unexpected first message: %r" % ev)
+            raise
         self.context = ev.get("context")
         self._started = True
         return self
 
-    def _read(self):
-        line = self.proc.stdout.readline()
+    def _readline(self, deadline):
+        """One line from the ssh pipe, honouring `deadline`. Keeps its own buffer: select() on
+        the fd can't see lines already pulled into a BufferedReader (two replies arriving in one
+        read would leave the second invisible and time out)."""
+        fd = self.proc.stdout.fileno()
+        while b"\n" not in self._rbuf:
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([fd], [], [], left)[0]:
+                    raise CommandTimeout("no reply from remote within the allowed time")
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                line, self._rbuf = bytes(self._rbuf), bytearray()
+                return line
+            self._rbuf += chunk
+        i = self._rbuf.index(b"\n") + 1
+        line = bytes(self._rbuf[:i])
+        del self._rbuf[:i]
+        return line
+
+    def _read(self, deadline=None):
+        line = self._readline(deadline)
         if not line:
             rc = self._finish()
             raise SessionDead("remote closed connection (ssh exit %s)" % rc)
@@ -756,9 +819,10 @@ class RemoteSession(object):
             self.proc.stdin.flush()
         except (BrokenPipeError, OSError):
             raise SessionDead("remote connection lost")
-        r = self._read()
+        # the remote enforces `timeout` itself; this is only a backstop for a hung connection
+        r = self._read(time.monotonic() + timeout + 15 if timeout else None)
         if r.get("event") == "error":
-            raise NewroleError(r.get("message"))
+            raise_event_error(r)
         return r
 
     def nest(self, host, cfg, password, ssh="ssh", ssh_opts=(), remote_python="python3", remote_path=None):
@@ -770,6 +834,7 @@ class RemoteSession(object):
         if self._nested_child is not None:
             raise NewroleError("a nested session is already open on this connection; close it first")
         pw = password if isinstance(password, bytearray) else bytearray(password)
+        cfg = dict(cfg, nested=True)        # tells the far serve() that "unnest" means exit
         req = {"op": "nest", "host": host, "ssh": ssh, "ssh_opts": list(ssh_opts),
                "remote_python": remote_python, "remote_path": remote_path}
         try:
@@ -785,15 +850,15 @@ class RemoteSession(object):
             raise SessionDead("remote connection lost")
         finally:
             wipe(pw)
-        ev = self._read()
+        ev = self._read(time.monotonic() + cfg.get("auth_timeout", 30.0) + 30.0)
         if ev.get("event") == "error":
-            raise {"auth": AuthError, "context": ContextError}.get(ev.get("kind"), NewroleError)(ev.get("message"))
+            raise_event_error(ev)
         if ev.get("event") != "ready":
             raise NewroleError("unexpected reply to nest: %r" % ev)
         child = RemoteSession.__new__(RemoteSession)
         child.host, child.cfg, child.password, child.ssh_env = host, cfg, None, None
         child.ssh, child.ssh_opts, child.remote_python, child.remote_path = ssh, list(ssh_opts), remote_python, remote_path
-        child.proc, child.context = self.proc, ev.get("context")
+        child.proc, child.context, child._rbuf = self.proc, ev.get("context"), self._rbuf
         child._nested, child._parent, child._nested_child = True, self, None
         child._started = True
         self._nested_child = child
@@ -814,10 +879,15 @@ class RemoteSession(object):
         if self._nested_child is not None:
             self._nested_child.close()
         if self._nested:
+            # "unnest" (not "close"): if the far end already exited on its own (timeout, dead
+            # shell) the relay is gone and this line reaches *our* serve(), which ignores it;
+            # a "close" there would terminate the outer session.
             try:
-                self.proc.stdin.write(b'{"op":"close"}\n')
+                self.proc.stdin.write(b'{"op":"unnest"}\n')
                 self.proc.stdin.flush()
-                self._read()               # expect {"event":"unnested",...}
+                deadline = time.monotonic() + 15.0
+                while self._read(deadline).get("event") != "unnested":
+                    pass
             except Exception:
                 pass
             if self._parent is not None:
@@ -877,9 +947,12 @@ def serve():
                 emit({"event": "error", "message": "bad request"})
                 continue
             op = req.get("op")
-            if op == "close":
+            if op == "close" or (op == "unnest" and cfg.get("nested")):
                 break
+            if op == "unnest":
+                continue                    # stale: the nested peer already ended on its own
             if op == "nest":
+                nonce = None
                 try:
                     nonce = sess.nest_open(req["host"], req.get("ssh", "ssh"), req.get("ssh_opts") or [],
                                            req.get("remote_python", "python3"), req.get("remote_path"))
@@ -889,12 +962,14 @@ def serve():
                     ncfg = json.loads(rd.readline().decode())
                     npw = bytearray(rd.readline().rstrip(b"\r\n"))
                     sess.nest_handshake(ncfg, npw, script_b64)
-                    ev = sess.nest_read_event(nonce, time.time() + float(ncfg.get("auth_timeout", 30.0)))
-                except NewroleError as e:
-                    emit({"event": "error", "message": "nest failed: %s" % e})
-                    continue
+                    ev = sess.nest_read_event(nonce, time.monotonic() + float(ncfg.get("auth_timeout", 30.0)))
                 except Exception as e:
-                    emit({"event": "error", "message": "nest failed: %s: %s" % (type(e).__name__, e)})
+                    if nonce is not None and not isinstance(e, NestEnded):
+                        sess.nest_abort(nonce)
+                    msg = str(e) if isinstance(e, NewroleError) else "%s: %s" % (type(e).__name__, e)
+                    emit({"event": "error", "message": "nest failed: %s" % msg})
+                    if not sess.alive:
+                        break
                     continue
                 emit(ev)
                 if ev.get("event") == "error":
@@ -904,20 +979,18 @@ def serve():
                         pass
                     continue
                 out.flush()
-                try:
-                    rc = sess.nest_proxy(rd, sys.stdout.buffer, nonce)
-                except SessionDead:
-                    raise
+                rc = sess.nest_proxy(rd, sys.stdout.buffer, nonce)
                 emit({"event": "unnested", "rc": rc})
                 continue
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 res = sess.run(req["cmd"], req.get("timeout"), bool(req.get("isolate")),
                                bool(req.get("stderr")), req.get("answers"))
-                res["duration"] = round(time.time() - t0, 3)
+                res["duration"] = round(time.monotonic() - t0, 3)
                 emit(res)
             except NewroleError as e:
-                emit({"event": "error", "message": str(e)})
+                emit({"event": "error", "kind": "timeout" if isinstance(e, CommandTimeout) else "session",
+                      "message": str(e)})
                 if not sess.alive:
                     break
     finally:
@@ -966,7 +1039,7 @@ def batch(sess, cmds, a):
             sys.stderr.write("newrole-batch: [%d] %s\n" % (i, e))
             if a.json:
                 print(json.dumps({"index": i, "cmd": c, "rc": None, "error": str(e)}))
-            return EXIT_TIMEOUT if "timeout" in str(e) else EXIT_SESSION
+            return EXIT_TIMEOUT if isinstance(e, CommandTimeout) else EXIT_SESSION
         if a.json:
             r.update({"index": i, "cmd": c})
             print(json.dumps(r))

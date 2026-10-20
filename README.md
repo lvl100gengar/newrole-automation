@@ -125,3 +125,7 @@ variables override the file. With a target set, the shared tests run on both bac
 real-only tests (SELinux context, CLI exit codes, `--commands-file`/`--script`, nesting with
 `NRB_NEST_HOST`) are enabled. The wrong-password tests count toward `pam_faillock` and need
 `NRB_ALLOW_LOCKOUT=1` against a real host.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

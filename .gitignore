@@ -22,6 +22,9 @@ htmlcov/
 # Secrets / local config
 .env
 .env.*
+!.env.example
+!tests/.env.example
+tests/pw
 *.pem
 *.key
 

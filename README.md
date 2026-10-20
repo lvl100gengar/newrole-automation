@@ -82,3 +82,20 @@ level (close it, or exit its `with` block, before opening another at that level)
 * `exit` / a shell crash inside a command ends the session (exit 4). `set -e`/`set -u` in persistent mode
   persist; use `--isolate` to avoid that.
 * Passwords containing a newline are unsupported.
+
+## Tests
+
+One pytest suite, two interchangeable backends (`tests/conftest.py`):
+
+```
+pip install -r requirements-dev.txt
+python3 -m pytest tests            # offline: NewroleSession against a fake `newrole` on a pty
+```
+
+To also run everything against a real SELinux host, copy `tests/.env.example` to `tests/.env`
+(git-ignored) and fill in `NRB_TARGET`, `NRB_PASSWORD_FILE` (or `NRB_PASSWORD`) and optionally
+`NRB_SSH_KEY`; without a key, ssh logs in with the same password via `SSH_ASKPASS`. Environment
+variables override the file. With a target set, the shared tests run on both backends and the
+real-only tests (SELinux context, CLI exit codes, `--commands-file`/`--script`, nesting with
+`NRB_NEST_HOST`) are enabled. The wrong-password tests count toward `pam_faillock` and need
+`NRB_ALLOW_LOCKOUT=1` against a real host.

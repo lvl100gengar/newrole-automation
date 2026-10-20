@@ -98,7 +98,8 @@ class _Timeout(Exception):
 
 def raise_event_error(ev):
     """Raise the exception matching an {"event": "error"} reply from a serve() peer."""
-    exc = {"auth": AuthError, "context": ContextError, "timeout": CommandTimeout}.get(
+    exc = {"auth": AuthError, "context": ContextError, "timeout": CommandTimeout,
+           "dead": SessionDead}.get(
         ev.get("kind"), NewroleError)
     raise exc(ev.get("message"))
 
@@ -1000,8 +1001,9 @@ def serve():
                 res["duration"] = round(time.monotonic() - t0, 3)
                 emit(res)
             except NewroleError as e:
-                emit({"event": "error", "kind": "timeout" if isinstance(e, CommandTimeout) else "session",
-                      "message": str(e)})
+                kind = ("timeout" if isinstance(e, CommandTimeout)
+                        else "dead" if isinstance(e, SessionDead) else "session")
+                emit({"event": "error", "kind": kind, "message": str(e)})
                 if not sess.alive:
                     break
     finally:

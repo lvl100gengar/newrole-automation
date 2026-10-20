@@ -67,9 +67,8 @@ level (close it, or exit its `with` block, before opening another at that level)
 * **Password is sent once, never retried.** A wrong password = exactly one PAM failure, so `pam_faillock`
   can't be tripped by the tool. A re-prompt or early exit aborts (exit 3).
 * **Fails closed:** the real context is read from `/proc/$$/attr/current` after login and must match `-r`/`-t`.
-* Password never appears in argv, env, ssh command line, disk, or logs (verified with `ps` and a log grep on
-  the target). Sent to the target on ssh stdin. Process sets `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, umask 077,
-  wipes its `bytearray` copy. Python can't guarantee zeroisation of every transient copy.
+* Password never appears in argv, env, ssh command line, disk, or logs. Sent to the target on ssh
+  stdin. Process sets `RLIMIT_CORE=0`, `PR_SET_DUMPABLE=0`, umask 077, wipes its `bytearray` copy. Python can't guarantee zeroisation of every transient copy.
 * `newrole` is invoked by absolute path, checked root-owned/not writable, with a scrubbed environment.
 * Shell is non-interactive (`bash --noprofile --norc /dev/stdin`): no profile, `TMOUT`, history or prompt.
 

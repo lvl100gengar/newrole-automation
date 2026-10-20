@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "examples"))
-import newrole_batch as nb  # noqa: E402
+import newrole_batch as nb
 
 FAKE_NEWROLE = """#!/bin/bash
 printf 'Password: '
@@ -62,7 +62,7 @@ def _load_dotenv():
 _load_dotenv()
 
 
-class Real(object):
+class Real:
     """Settings for the real-host backend, all from NRB_* variables."""
 
     def __init__(self):

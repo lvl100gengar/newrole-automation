@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """newrole-batch: run many commands under an SELinux role that requires
 `newrole` (PAM password prompt), authenticating exactly once.
 
@@ -79,7 +78,7 @@ class ContextError(NewroleError):
 
 class SessionDead(NewroleError):
     def __init__(self, msg, partial=b""):
-        NewroleError.__init__(self, msg)
+        super().__init__(msg)
         self.partial = partial
 
 
@@ -115,11 +114,11 @@ def harden_process():
     """Best-effort: no core dumps, not dumpable/ptrace-able, private umask."""
     try:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    except Exception:
+    except (OSError, ValueError):
         pass
     try:
         ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)      # PR_SET_DUMPABLE = 0
-    except Exception:
+    except (OSError, AttributeError):
         pass
     os.umask(0o077)
 
@@ -130,7 +129,7 @@ def wipe(ba):
             ba[i] = 0
 
 
-class Audit(object):
+class Audit:
     """syslog (authpriv) trail: session start/end, auth failures, command hashes."""
 
     def __init__(self, mode="hash", enabled=True):
@@ -142,7 +141,7 @@ class Audit(object):
         if self.enabled:
             try:
                 syslog.syslog(prio, msg.replace("\n", " ")[:900])
-            except Exception:
+            except (OSError, ValueError):
                 pass
 
     def command(self, idx, cmd):
@@ -155,12 +154,12 @@ class Audit(object):
                 idx, hashlib.sha256(cmd.encode("utf-8", "replace")).hexdigest()[:16], len(cmd)))
 
 
-class NewroleSession(object):
-    def __init__(self, role, password, type=None, level=None, newrole=NEWROLE,
+class NewroleSession:
+    def __init__(self, role, password, se_type=None, level=None, newrole=NEWROLE,
                  auth_timeout=30.0, max_output=64 * 1024 * 1024, audit=None):
-        self.role, self.type, self.level = role, type, level
+        self.role, self.se_type, self.level = role, se_type, level
         self.newrole, self.auth_timeout, self.max_output = newrole, auth_timeout, max_output
-        self.password = password if isinstance(password, bytearray) else bytearray(password)
+        self.password = bytearray(password)      # own copy: the caller's buffer is left alone
         self.audit = audit or Audit(enabled=False)
         self.pid = self.fd = None
         self.buf = bytearray()
@@ -177,8 +176,8 @@ class NewroleSession(object):
     def start(self):
         self._check_newrole()
         argv = [self.newrole, "-r", self.role]
-        if self.type:
-            argv += ["-t", self.type]
+        if self.se_type:
+            argv += ["-t", self.se_type]
         if self.level:
             argv += ["-l", self.level]
         argv += ["--", "-c", "exec /bin/bash --noprofile --norc /dev/stdin"]
@@ -189,7 +188,7 @@ class NewroleSession(object):
             home, name = "/", str(os.getuid())
         env = {"PATH": SAFE_PATH, "LANG": "C", "TERM": "dumb", "HOME": home,
                "USER": name, "LOGNAME": name}
-        self.audit.log("start user=%s role=%s type=%s level=%s" % (name, self.role, self.type, self.level))
+        self.audit.log("start user=%s role=%s type=%s level=%s" % (name, self.role, self.se_type, self.level))
         pid, fd = pty.fork()
         if pid == 0:                                # child: fresh session, pty is ctty
             try:
@@ -226,7 +225,11 @@ class NewroleSession(object):
         try:
             self._expect_prompt(deadline)
             self.buf.clear()
-            self._write(bytes(self.password) + b"\n")
+            line = self.password + b"\n"           # bytearray: wiped right after the write
+            try:
+                self._write(line)
+            finally:
+                wipe(line)
             wipe(self.password)
             # The frame is queued in the tty until the shell starts reading. Resend rarely, and
             # never while a password prompt is showing: a re-prompt (failed PAM conversation)
@@ -257,17 +260,17 @@ class NewroleSession(object):
             wipe(self.password)
 
     def _expect_prompt(self, deadline):
-        while not PROMPT_RE.search(bytes(self.buf)):
+        while not PROMPT_RE.search(self.buf):
             if not self._wait_readable(deadline):
                 raise AuthError("no password prompt from newrole: %s" % self._text(bytes(self.buf)).strip())
             self._pump()
 
     def _verify_context(self):
-        out, rc, _ = self.run_raw('read -r -d "" c </proc/$$/attr/current; printf "%s" "$c"', 15)
+        out, _rc, _ = self.run_raw('read -r -d "" c </proc/$$/attr/current; printf "%s" "$c"', 15)
         ctx = self._text(out).strip().rstrip("\x00")
         parts = ctx.split(":")
-        if len(parts) < 3 or parts[1] != self.role or (self.type and parts[2] != self.type):
-            raise ContextError("landed in context %r, wanted role=%s type=%s" % (ctx, self.role, self.type))
+        if len(parts) < 3 or parts[1] != self.role or (self.se_type and parts[2] != self.se_type):
+            raise ContextError("landed in context %r, wanted role=%s type=%s" % (ctx, self.role, self.se_type))
         self.context = ctx
         self.audit.log("authenticated context=%s" % ctx)
 
@@ -323,7 +326,9 @@ class NewroleSession(object):
 
     # ---------------------------------------------------------------- commands
     def run(self, cmd, timeout=None, isolate=False, stderr=False, answers=None):
-        """Run `cmd` (any shell text) in the role. Returns dict(rc, out, truncated[, err]).
+        """Run `cmd` (any shell text) in the role. Returns
+        dict(rc, out, err, truncated, duration) -- the same keys on every backend; `err` is
+        "" unless stderr=True.
 
         stderr=True   capture stderr separately into res["err"] (default: merged into "out")
         answers       [(prompt_regex, password), ...]: when a prompt matching the regex shows up
@@ -332,10 +337,11 @@ class NewroleSession(object):
         """
         self.n += 1
         self.audit.command(self.n, cmd)
+        t0 = time.monotonic()
         out, rc, err = self.run_raw(cmd, timeout, isolate, stderr, answers)
-        res = {"rc": rc, "out": self._text(out), "truncated": self.truncated}
-        if stderr:
-            res["err"] = self._text(base64.b64decode(err)) if err else ""
+        res = {"rc": rc, "out": self._text(out),
+               "err": self._text(base64.b64decode(err)) if err else "",
+               "truncated": self.truncated, "duration": round(time.monotonic() - t0, 3)}
         self.truncated = False
         return res
 
@@ -529,8 +535,12 @@ class NewroleSession(object):
         if script_b64 is not None:
             self._write(script_b64 + b"\n")
         self._write(json.dumps(cfg).encode() + b"\n")
-        self._write(bytes(password) + b"\n")
-        wipe(password)
+        line = password + b"\n"
+        try:
+            self._write(line)
+        finally:
+            wipe(line)
+            wipe(password)
 
     def nest_send(self, obj):
         self._write(json.dumps(obj).encode() + b"\n")
@@ -672,7 +682,7 @@ class NewroleSession(object):
             fcntl.fcntl(rfd, fcntl.F_SETFL, flags)
 
 
-class NestedSession(object):
+class NestedSession:
     """A newrole session on a second host, opened in-process by running `ssh` inside the
     role shell of an already-authenticated NewroleSession (the jump/bastion pattern). Same
     run()/close() interface as NewroleSession and RemoteSession."""
@@ -680,7 +690,7 @@ class NestedSession(object):
     def __init__(self, parent, host, cfg, password, ssh="ssh", ssh_opts=(), remote_python="python3",
                  remote_path=None, auth_timeout=30.0):
         self.parent, self.host, self.cfg = parent, host, cfg
-        self.password = password if isinstance(password, bytearray) else bytearray(password)
+        self.password = bytearray(password)
         self.ssh, self.ssh_opts = ssh, list(ssh_opts)
         self.remote_python, self.remote_path = remote_python, remote_path
         self.auth_timeout = auth_timeout
@@ -749,19 +759,18 @@ class NestedSession(object):
 # -------------------------------------------------------------------- remote
 
 
-class RemoteSession(object):
+class RemoteSession:
     """Same run() interface, but the NewroleSession lives on an ssh target."""
 
     def __init__(self, host, cfg, password, ssh="ssh", ssh_opts=(), remote_python="python3", remote_path=None,
                  ssh_env=None):
-        self.host, self.cfg, self.password = host, cfg, password
+        self.host, self.cfg = host, cfg
+        self.password = bytearray(password)
         self.ssh, self.ssh_opts, self.remote_python, self.remote_path = ssh, list(ssh_opts), remote_python, remote_path
         self.proc = None
         self._rbuf = bytearray()
         self.context = None
         self.ssh_env = ssh_env          # extra env for the ssh client only (e.g. SSH_ASKPASS)
-        self._nested = False            # True for a session returned by .nest(): shares proc
-        self._parent = None
         self._nested_child = None
         self._started = False           # a .nest()-returned child is already started; `with`
                                         # on it must not call start() again
@@ -776,8 +785,10 @@ class RemoteSession(object):
             with open(os.path.realpath(__file__), "rb") as f:
                 w.write(base64.b64encode(f.read()) + b"\n")
         w.write(json.dumps(self.cfg).encode() + b"\n")
-        w.write(bytes(self.password) + b"\n")
+        line = self.password + b"\n"
+        w.write(line)
         w.flush()
+        wipe(line)
         wipe(self.password)
         try:
             ev = self._read(time.monotonic() + self.cfg.get("auth_timeout", 30.0) + 30.0)
@@ -845,7 +856,7 @@ class RemoteSession(object):
         be open at a time (nest the returned session again for a third hop)."""
         if self._nested_child is not None:
             raise NewroleError("a nested session is already open on this connection; close it first")
-        pw = password if isinstance(password, bytearray) else bytearray(password)
+        pw = bytearray(password)
         cfg = dict(cfg, nested=True)        # tells the far serve() that "unnest" means exit
         req = {"op": "nest", "host": host, "ssh": ssh, "ssh_opts": list(ssh_opts),
                "remote_python": remote_python, "remote_path": remote_path}
@@ -856,8 +867,10 @@ class RemoteSession(object):
                 with open(os.path.realpath(__file__), "rb") as f:
                     w.write(base64.b64encode(f.read()) + b"\n")
             w.write(json.dumps(cfg).encode() + b"\n")
-            w.write(bytes(pw) + b"\n")
+            line = pw + b"\n"
+            w.write(line)
             w.flush()
+            wipe(line)
         except (BrokenPipeError, OSError):
             raise SessionDead("remote connection lost")
         finally:
@@ -867,49 +880,31 @@ class RemoteSession(object):
             raise_event_error(ev)
         if ev.get("event") != "ready":
             raise NewroleError("unexpected reply to nest: %r" % ev)
-        child = RemoteSession.__new__(RemoteSession)
-        child.host, child.cfg, child.password, child.ssh_env = host, cfg, None, None
-        child.ssh, child.ssh_opts, child.remote_python, child.remote_path = ssh, list(ssh_opts), remote_python, remote_path
-        child.proc, child.context, child._rbuf = self.proc, ev.get("context"), self._rbuf
-        child._nested, child._parent, child._nested_child = True, self, None
-        child._started = True
+        child = _NestedRemote(self, host, cfg, ssh, ssh_opts, remote_python, remote_path,
+                              ev.get("context"))
         self._nested_child = child
         return child
 
     def _finish(self):
         try:
             self.proc.stdin.close()
-        except Exception:
+        except OSError:
             pass
         try:
             return self.proc.wait(timeout=10)
-        except Exception:
+        except subprocess.TimeoutExpired:
             self.proc.kill()
+            self.proc.wait()
             return -1
 
     def close(self):
         if self._nested_child is not None:
             self._nested_child.close()
-        if self._nested:
-            # "unnest" (not "close"): if the far end already exited on its own (timeout, dead
-            # shell) the relay is gone and this line reaches *our* serve(), which ignores it;
-            # a "close" there would terminate the outer session.
-            try:
-                self.proc.stdin.write(b'{"op":"unnest"}\n')
-                self.proc.stdin.flush()
-                deadline = time.monotonic() + 15.0
-                while self._read(deadline).get("event") != "unnested":
-                    pass
-            except Exception:
-                pass
-            if self._parent is not None:
-                self._parent._nested_child = None
-            return
         if self.proc and self.proc.poll() is None:
             try:
                 self.proc.stdin.write(b'{"op":"close"}\n')
                 self.proc.stdin.flush()
-            except Exception:
+            except OSError:
                 pass
             self._finish()
 
@@ -922,9 +917,36 @@ class RemoteSession(object):
         self.close()
 
 
+class _NestedRemote(RemoteSession):
+    """A RemoteSession for a second host, sharing its parent's ssh connection (and read
+    buffer). Returned by RemoteSession.nest(); already started, closed by "unnest"."""
+
+    def __init__(self, parent, host, cfg, ssh, ssh_opts, remote_python, remote_path, context):
+        super().__init__(host, cfg, b"", ssh, ssh_opts, remote_python, remote_path)
+        wipe(self.password)
+        self.proc, self._rbuf, self._parent = parent.proc, parent._rbuf, parent
+        self.context = context
+        self._started = True
+
+    def close(self):
+        if self._nested_child is not None:
+            self._nested_child.close()
+        # "unnest" (not "close"): if the far end already exited on its own (timeout, dead
+        # shell) the relay is gone and this line reaches *our* serve(), which ignores it;
+        # a "close" there would terminate the outer session.
+        try:
+            self.proc.stdin.write(b'{"op":"unnest"}\n')
+            self.proc.stdin.flush()
+            deadline = time.monotonic() + 15.0
+            while self._read(deadline).get("event") != "unnested":
+                pass
+        except (NewroleError, OSError, ValueError):
+            pass
+        self._parent._nested_child = None
+
+
 def serve():
     """Remote end: stdin is a binary pipe; stdout carries JSON lines only."""
-    harden_process()
     rd, out = sys.stdin.buffer, sys.stdout
 
     def emit(o):
@@ -937,6 +959,7 @@ def serve():
     sess = NewroleSession(cfg["role"], pw, cfg.get("type"), cfg.get("level"),
                           cfg.get("newrole") or NEWROLE, cfg.get("auth_timeout", 30.0),
                           cfg.get("max_output", 64 * 1024 * 1024), audit)
+    wipe(pw)                                        # the session holds its own copy
     try:
         sess.start()
     except AuthError as e:
@@ -994,12 +1017,9 @@ def serve():
                 rc = sess.nest_proxy(rd, sys.stdout.buffer, nonce)
                 emit({"event": "unnested", "rc": rc})
                 continue
-            t0 = time.monotonic()
             try:
-                res = sess.run(req["cmd"], req.get("timeout"), bool(req.get("isolate")),
-                               bool(req.get("stderr")), req.get("answers"))
-                res["duration"] = round(time.monotonic() - t0, 3)
-                emit(res)
+                emit(sess.run(req["cmd"], req.get("timeout"), bool(req.get("isolate")),
+                              bool(req.get("stderr")), req.get("answers")))
             except NewroleError as e:
                 kind = ("timeout" if isinstance(e, CommandTimeout)
                         else "dead" if isinstance(e, SessionDead) else "session")
@@ -1036,7 +1056,7 @@ def gather_commands(a):
     cmds = list(a.command or [])
     if a.commands_file:
         with open(a.commands_file) as f:
-            cmds += [l.rstrip("\n") for l in f if l.strip() and not l.lstrip().startswith("#")]
+            cmds += [line.rstrip("\n") for line in f if line.strip() and not line.lstrip().startswith("#")]
     if a.script:
         with open(a.script) as f:
             cmds.append(f.read())

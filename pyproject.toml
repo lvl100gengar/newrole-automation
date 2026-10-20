@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py37"          # the code itself still runs on 3.6 (RHEL 7 targets)
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "UP031",   # %-formatting is used to build shell text, where "%%" escapes matter
+    "UP032",   # ...same for .format()/f-string suggestions
+    "SIM105",  # contextlib.suppress would add an import to the streamed single-file script
+    "B904",    # re-raise without "from": messages are rewritten on purpose
+    "RUF005",  # list concatenation reads fine for argv building
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]             # tests insert the repo root into sys.path before importing
+"examples/*" = ["E402"]

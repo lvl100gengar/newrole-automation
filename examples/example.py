@@ -34,7 +34,7 @@ if os.environ.get("NRB_ASKPASS_MODE"):
     sys.exit(0)
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from newrole_batch import RemoteSession, NewroleError, AuthError  # noqa: E402
+from newrole_batch import RemoteSession, NewroleError, AuthError
 
 
 def make_askpass_ssh(sess, password):

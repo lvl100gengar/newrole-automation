@@ -194,7 +194,8 @@ def test_real_cli_state_commands_file_and_script(real, secrets, tmp_path):
 
 def test_real_cli_loose_password_file_refused(real, secrets, tmp_path):
     loose = tmp_path / "loose"
-    loose.write_bytes(open(secrets["pwfile"], "rb").read())
+    with open(secrets["pwfile"], "rb") as f:
+        loose.write_bytes(f.read())
     loose.chmod(0o644)
     assert cli(real, secrets, "-c", "id", pwfile=str(loose)).returncode != 0
 

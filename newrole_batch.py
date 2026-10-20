@@ -197,6 +197,8 @@ class NewroleSession(object):
                 a[1] &= ~termios.ONLCR
                 termios.tcsetattr(0, termios.TCSANOW, a)
                 os.execve(argv[0], argv, env)
+            except OSError as e:                    # surfaces in the parent as newrole's output
+                os.write(2, ("cannot execute %s: %s\n" % (argv[0], e)).encode())
             finally:
                 os._exit(127)
         self.pid, self.fd = pid, fd
@@ -435,6 +437,7 @@ class NewroleSession(object):
         pat = re.compile(rb"\nNRB" + self.nonce.encode() + re.escape(name.encode()) + rb":(\d+):([A-Za-z0-9+/=]*)\n")
         pending = [(re.compile(r.encode() if isinstance(r, str) else r), pw) for r, pw in (answers or [])]
         start = 0
+        answered_at = []
         while True:
             m = pat.search(self.buf, start)
             if m:
@@ -442,6 +445,12 @@ class NewroleSession(object):
                 err = m.group(2)
                 out = bytes(self.buf[:m.start()])
                 del self.buf[:m.end()]
+                # the program prints a newline after reading the (unechoed) answer: drop it too
+                for pos in reversed(answered_at):
+                    for nl in (b"\r\n", b"\n"):
+                        if out[pos:pos + len(nl)] == nl:
+                            out = out[:pos] + out[pos + len(nl):]
+                            break
                 return out, rc, err
             if deadline is not None and time.monotonic() >= deadline:
                 raise _Timeout()
@@ -452,6 +461,7 @@ class NewroleSession(object):
                     if pm:
                         pending.remove(item)
                         del self.buf[pm.start():pm.end()]
+                        answered_at.append(pm.start())
                         pw = item[1]
                         self._write((pw if isinstance(pw, bytes) else pw.encode()) + b"\n")
                 start = max(0, len(self.buf) - n - len(name) - len(self.nonce) - 16)
@@ -467,8 +477,8 @@ class NewroleSession(object):
              remote_path=None, auth_timeout=30.0):
         """Open a NewroleSession on `host`, reached via ssh run inside this role shell.
         Returns a NestedSession with the same run()/close() interface. Only one nested
-        session may be open on a given session at a time (close it before opening another,
-        or call .nest() again on the returned NestedSession itself for a third hop)."""
+        session may be open on a given session at a time (close it before opening another).
+        Chaining a third hop from a NestedSession is not supported."""
         if self._nested_child is not None:
             raise NewroleError("a nested session is already open; close it first")
         child = NestedSession(self, host, cfg, password, ssh, ssh_opts, remote_python,
@@ -793,7 +803,8 @@ class RemoteSession(object):
                     raise CommandTimeout("no reply from remote within the allowed time")
             chunk = os.read(fd, 65536)
             if not chunk:
-                line, self._rbuf = bytes(self._rbuf), bytearray()
+                line = bytes(self._rbuf)
+                self._rbuf.clear()
                 return line
             self._rbuf += chunk
         i = self._rbuf.index(b"\n") + 1
@@ -1001,10 +1012,10 @@ def serve():
 # ----------------------------------------------------------------------- CLI
 def read_password(a, role):
     if a.password_file:
-        st = os.stat(a.password_file)
-        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
-            sys.exit("password file must be owned by you with mode 0600/0400")
         with open(a.password_file, "rb") as f:
+            st = os.fstat(f.fileno())               # check the file we actually opened
+            if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+                sys.exit("password file must be owned by you with mode 0600/0400")
             return bytearray(f.readline().rstrip(b"\r\n"))
     if a.password_fd is not None:
         data = b""
@@ -1096,8 +1107,6 @@ def main(argv=None):
     cmds = gather_commands(a)
     if not cmds:
         sys.stderr.write("no commands given (-c / --commands-file / --script)\n")
-        return EXIT_USAGE
-    if a.password_stdin and not (a.command or a.commands_file or a.script):
         return EXIT_USAGE
     pw_ba = read_password(a, a.role)
     cfg = {"role": a.role, "type": a.type, "level": a.level, "audit": a.audit,

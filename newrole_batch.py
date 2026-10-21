@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Source must stay ASCII and py2.7/py3 compatible: it is exec()ed on targets that may only have python 2.7.
 """newrole-batch: run many commands under an SELinux role that requires
 `newrole` (PAM password prompt), authenticating exactly once.
 
@@ -10,7 +11,8 @@ Modes
           back end); line 1 = JSON config, line 2 = raw password,
           then one JSON request per line.
 
-Requirements: Python >= 3.6, standard library only (no packages to install).
+Requirements: Python 2.7 or >= 3.6 (on the machine running it, and on ssh targets), standard
+library only (no packages to install).
 
 Design notes
   * One pty, one `newrole`, one persistent shell inside the new context.
@@ -39,7 +41,6 @@ import pwd
 import re
 import resource
 import select
-import shlex
 import signal
 import stat
 import subprocess
@@ -47,6 +48,11 @@ import sys
 import syslog
 import termios
 import time
+
+try:
+    from shlex import quote as shquote
+except ImportError:                 # python 2
+    from pipes import quote as shquote
 
 VERSION = "1.0.0"
 
@@ -57,13 +63,18 @@ NEWROLE = "/usr/bin/newrole"
 SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 REPLY_GRACE = 15.0                # extra seconds RemoteSession waits beyond a command's own timeout
 CHUNK = 2400                      # b64 chars per tty line (tty canonical limit is 4095)
-PROMPT_RE = re.compile(rb"[Pp]assword[^\r\n]{0,40}: ?$")
+PROMPT_RE = re.compile(br"[Pp]assword[^\r\n]{0,40}: ?$")
+PY2 = sys.version_info[0] == 2
+monotonic = getattr(time, "monotonic", time.time)      # no time.monotonic before 3.3
+_IOERRORS = (OSError, IOError)                          # distinct classes on python 2
 
 # Bootstrap a controller streams over a bare `python3 -c SERVE_BOOT serve` invocation: it reads
 # one base64 line (this whole file) from stdin and execs it, so `serve()` below then reads the
 # cfg/password lines that follow. Used for the first hop (RemoteSession) and for every further
 # hop opened with NewroleSession.nest()/RemoteSession.nest().
-SERVE_BOOT = "import sys,base64;exec(base64.b64decode(sys.stdin.buffer.readline()))"
+# stdin is read unbuffered (os.fdopen(..., 0)) so no cfg/password bytes are swallowed by a stdio
+# buffer; the file object stays referenced (as `f`) because closing it would close fd 0.
+SERVE_BOOT = "import os,base64;f=os.fdopen(0,'rb',0);exec(base64.b64decode(f.readline()))"
 
 
 class NewroleError(Exception):
@@ -80,7 +91,7 @@ class ContextError(NewroleError):
 
 class SessionDead(NewroleError):
     def __init__(self, msg, partial=b""):
-        super().__init__(msg)
+        super(SessionDead, self).__init__(msg)
         self.partial = partial
 
 
@@ -112,8 +123,8 @@ def raise_event_error(ev):
 def remote_command(python, path):
     """Shell text run by ssh on the target to start serve(); both parts are quoted."""
     if path:
-        return "%s %s serve" % (shlex.quote(python), shlex.quote(path))
-    return "%s -c %s serve" % (shlex.quote(python), shlex.quote(SERVE_BOOT))
+        return "%s %s serve" % (shquote(python), shquote(path))
+    return "%s -c %s serve" % (shquote(python), shquote(SERVE_BOOT))
 
 
 def harden_process():
@@ -129,23 +140,77 @@ def harden_process():
     os.umask(0o077)
 
 
+def to_bytes(s):
+    """utf-8 bytes of a command/prompt/password given as text or bytes (py2 str is bytes)."""
+    return s if isinstance(s, bytes) else s.encode("utf-8")
+
+
+def to_json_text(s):
+    """Text for a JSON request: py3 bytes are decoded; a py2 str already is the native text."""
+    return s.decode("utf-8") if not PY2 and isinstance(s, bytes) else s
+
+
+def select_retry(r, w, x, timeout):
+    """select() that survives EINTR (python 2 raises select.error and never retries)."""
+    end = None if timeout is None else monotonic() + timeout
+    while True:
+        try:
+            return select.select(r, w, x, timeout)
+        except (select.error, OSError) as e:
+            if e.args[0] != errno.EINTR:
+                raise
+            if end is not None:
+                timeout = max(0.0, end - monotonic())
+
+
+def would_block(e):
+    return e.errno in (errno.EAGAIN, errno.EWOULDBLOCK)
+
+
+class LineReader(object):
+    """readline() plus non-blocking draining over a raw fd, with our own buffer. Python 2's
+    sys.stdin has neither peek() nor read1(), and select() cannot see its stdio buffer."""
+
+    def __init__(self, fd):
+        self.fd, self.buf = fd, bytearray()
+
+    def readline(self):
+        while b"\n" not in self.buf:
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                break
+            self.buf += chunk
+        i = self.buf.find(b"\n") + 1 or len(self.buf)
+        line = bytes(self.buf[:i])
+        del self.buf[:i]
+        return line
+
+    def take(self):
+        data = bytes(self.buf)
+        del self.buf[:]
+        return data
+
+
 def wipe(ba):
     if isinstance(ba, bytearray):
         for i in range(len(ba)):
             ba[i] = 0
 
 
-class Audit:
+class Audit(object):
     """syslog (authpriv) trail: session start/end, auth failures, command hashes."""
 
     def __init__(self, mode="hash", enabled=True):
         self.mode, self.enabled = mode, enabled
         if enabled:
-            syslog.openlog("newrole-batch", syslog.LOG_PID, syslog.LOG_AUTHPRIV)
+            authpriv = getattr(syslog, "LOG_AUTHPRIV", 10 << 3)      # python 2 lacks the constant
+            syslog.openlog("newrole-batch", syslog.LOG_PID, authpriv)
 
     def log(self, msg, prio=syslog.LOG_INFO):
         if self.enabled:
             msg = msg.replace("\n", " ")
+            if PY2 and not isinstance(msg, bytes):
+                msg = msg.encode("utf-8")
             parts = [msg[i:i + 800] for i in range(0, len(msg), 800)] or [""]
             try:
                 for i, part in enumerate(parts, 1):
@@ -160,10 +225,10 @@ class Audit:
             self.log("cmd[%d]: %s" % (idx, cmd))
         else:
             self.log("cmd[%d] sha256=%s len=%d" % (
-                idx, hashlib.sha256(cmd.encode("utf-8", "replace")).hexdigest()[:16], len(cmd)))
+                idx, hashlib.sha256(to_bytes(cmd)).hexdigest()[:16], len(cmd)))
 
 
-class NewroleSession:
+class NewroleSession(object):
     def __init__(self, role, password, se_type=None, level=None, newrole=NEWROLE,
                  auth_timeout=30.0, max_output=64 * 1024 * 1024, audit=None):
         self.role, self.se_type, self.level = role, se_type, level
@@ -172,7 +237,7 @@ class NewroleSession:
         self.audit = audit or Audit(enabled=False)
         self.pid = self.fd = None
         self.buf = bytearray()
-        self.nonce = base64.b16encode(os.urandom(8)).decode().lower()
+        self.nonce = str(base64.b16encode(os.urandom(8)).decode().lower())
         self.n = 0
         self._seq = 0
         self.truncated = False
@@ -230,10 +295,10 @@ class NewroleSession:
             raise NewroleError("%s is not root-owned / is group-or-world writable" % self.newrole)
 
     def _authenticate(self):
-        deadline = time.monotonic() + self.auth_timeout
+        deadline = monotonic() + self.auth_timeout
         try:
             self._expect_prompt(deadline)
-            self.buf.clear()
+            del self.buf[:]
             line = self.password + b"\n"           # bytearray: wiped right after the write
             try:
                 self._write(line)
@@ -244,19 +309,19 @@ class NewroleSession:
             # never while a password prompt is showing: a re-prompt (failed PAM conversation)
             # would swallow the frame as a second password guess and count against faillock.
             self._write(self._frame_cmd("true", "S1"))
-            next_send = time.monotonic() + 5.0
+            next_send = monotonic() + 5.0
             while True:
-                if time.monotonic() > deadline:
+                if monotonic() > deadline:
                     raise AuthError("timed out waiting for shell after password")
                 try:
-                    self._collect("S1", min(deadline, time.monotonic() + 1.0))
+                    self._collect("S1", min(deadline, monotonic() + 1.0))
                     break
                 except _Timeout:
                     if PROMPT_RE.search(self.buf):
                         raise AuthError("newrole re-prompted for a password (wrong password?)")
-                    if time.monotonic() >= next_send:
+                    if monotonic() >= next_send:
                         self._write(self._frame_cmd("true", "S1"))
-                        next_send = time.monotonic() + 5.0
+                        next_send = monotonic() + 5.0
             # second, fresh sync: discard duplicates from the resends above
             self._write(self._frame_cmd("true", "S2"))
             self._collect("S2", deadline)
@@ -313,17 +378,19 @@ class NewroleSession:
             self.audit.log("end role=%s commands=%d" % (self.role, self.n))
 
     def _reap(self, timeout):
-        end = time.monotonic() + timeout
+        end = monotonic() + timeout
         while self.pid and self.exit_status is None:
             try:
                 p, st = os.waitpid(self.pid, os.WNOHANG)
-            except ChildProcessError:
+            except OSError as e:
+                if e.errno != errno.ECHILD:
+                    raise
                 self.exit_status = -1
                 return
             if p:
                 self.exit_status = st
                 return
-            if time.monotonic() > end:
+            if monotonic() > end:
                 return
             time.sleep(0.05)
 
@@ -346,11 +413,11 @@ class NewroleSession:
         """
         self.n += 1
         self.audit.command(self.n, cmd)
-        t0 = time.monotonic()
+        t0 = monotonic()
         out, rc, err = self.run_raw(cmd, timeout, isolate, stderr, answers)
         res = {"rc": rc, "out": self._text(out),
                "err": self._text(base64.b64decode(err)) if err else "",
-               "truncated": self.truncated, "duration": round(time.monotonic() - t0, 3)}
+               "truncated": self.truncated, "duration": round(monotonic() - t0, 3)}
         self.truncated = False
         return res
 
@@ -359,7 +426,7 @@ class NewroleSession:
             raise SessionDead("session not started or already terminated")
         self._seq += 1
         name = "C%d" % self._seq
-        t0 = time.monotonic()
+        t0 = monotonic()
         self._write(self._frame_cmd(cmd, name, isolate, stderr))
         deadline = t0 + timeout if timeout else None
         try:
@@ -380,7 +447,7 @@ class NewroleSession:
         return out, rc, err
 
     def _frame_cmd(self, cmd, name, isolate=False, stderr=False):
-        b64 = base64.b64encode(cmd.encode("utf-8")).decode("ascii")
+        b64 = base64.b64encode(to_bytes(cmd)).decode("ascii")
         lines = ["__c=''"]
         for i in range(0, len(b64), CHUNK):
             lines.append("__c=\"$__c\"'%s'" % b64[i:i + CHUNK])
@@ -398,23 +465,24 @@ class NewroleSession:
 
     # ---------------------------------------------------------------- io
     def _text(self, b):
-        return bytes(b).decode("utf-8", "replace")
+        t = bytes(b).decode("utf-8", "replace")
+        return t.encode("utf-8") if PY2 else t       # py2: native (byte) str, so str(e) etc. never trip on unicode
 
     def _wait_readable(self, deadline):
         while True:
-            t = 1.0 if deadline is None else max(0.0, min(1.0, deadline - time.monotonic()))
-            r, _, _ = select.select([self.fd], [], [], t)
+            t = 1.0 if deadline is None else max(0.0, min(1.0, deadline - monotonic()))
+            r, _, _ = select_retry([self.fd], [], [], t)
             if r:
                 return True
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and monotonic() >= deadline:
                 return False
 
     def _pump(self):
         try:
             data = os.read(self.fd, 65536)
-        except BlockingIOError:
-            return 0
         except OSError as e:
+            if would_block(e):
+                return 0
             if e.errno == errno.EIO:
                 self._reap(1.0)
                 raise SessionDead("pty closed", bytes(self.buf))
@@ -431,34 +499,34 @@ class NewroleSession:
 
     def _write(self, data, stall_timeout=30.0):
         off = 0
-        last_progress = time.monotonic()
+        last_progress = monotonic()
         while off < len(data):
-            if time.monotonic() - last_progress > stall_timeout:
+            if monotonic() - last_progress > stall_timeout:
                 raise SessionDead("write to pty stalled for %ss" % stall_timeout, bytes(self.buf))
-            r, w, _ = select.select([self.fd], [self.fd], [], 5.0)
+            r, w, _ = select_retry([self.fd], [self.fd], [], 5.0)
             if r:
                 self._pump()
             if w:
                 try:
                     off += os.write(self.fd, data[off:off + 2048])
-                    last_progress = time.monotonic()
-                except BlockingIOError:
-                    pass
+                    last_progress = monotonic()
                 except OSError as e:
+                    if would_block(e):
+                        continue
                     if e.errno == errno.EIO:
                         raise SessionDead("pty closed while writing", bytes(self.buf))
                     raise
 
     def _collect(self, name, deadline, answers=None):
-        pat = re.compile(rb"\nNRB" + self.nonce.encode() + re.escape(name.encode()) + rb":(\d+):([A-Za-z0-9+/=]*)\n")
-        pending = [(re.compile(r.encode() if isinstance(r, str) else r), pw) for r, pw in (answers or [])]
+        pat = re.compile(br"\nNRB" + self.nonce.encode() + re.escape(name.encode()) + br":(\d+):([A-Za-z0-9+/=]*)\n")
+        pending = [(re.compile(to_bytes(r)), pw) for r, pw in (answers or [])]
         start = 0
         answered_at = []
         while True:
             m = pat.search(self.buf, start)
             if m:
-                rc = int(m.group(1))                # read before mutating the buffer
-                err = m.group(2)
+                rc = int(bytes(m.group(1)))         # read before mutating the buffer
+                err = bytes(m.group(2))
                 out = bytes(self.buf[:m.start()])
                 del self.buf[:m.end()]
                 # the program prints a newline after reading the (unechoed) answer: drop it too
@@ -468,9 +536,9 @@ class NewroleSession:
                             out = out[:pos] + out[pos + len(nl):]
                             break
                 return out, rc, err
-            if deadline is not None and time.monotonic() >= deadline:
+            if deadline is not None and monotonic() >= deadline:
                 raise _Timeout()
-            if self._wait_readable(min(deadline, time.monotonic() + 1.0) if deadline else None):
+            if self._wait_readable(min(deadline, monotonic() + 1.0) if deadline else None):
                 n = self._pump()
                 for item in list(pending):
                     pm = item[0].search(self.buf, max(0, len(self.buf) - 1024))
@@ -479,12 +547,12 @@ class NewroleSession:
                         del self.buf[pm.start():pm.end()]
                         answered_at.append(pm.start())
                         pw = item[1]
-                        self._write((pw if isinstance(pw, bytes) else pw.encode()) + b"\n")
+                        self._write(to_bytes(pw) + b"\n")
                 start = max(0, len(self.buf) - n - len(name) - len(self.nonce) - 16)
 
     # ---------------------------------------------------------------- nesting (jump host)
     # These let a second `newrole` session be opened on host B by running `ssh` as a plain
-    # foreground command *inside this session's own role shell on host A* — so B is reached
+    # foreground command *inside this session's own role shell on host A* -- so B is reached
     # through A's already-authenticated, already-audited context, the same way a sysadmin
     # would do it by hand: ssh A, newrole, ssh B, newrole. The pty is switched to raw mode for
     # the duration so B's JSON-lines protocol (any length, any byte) passes through untouched;
@@ -504,7 +572,7 @@ class NewroleSession:
         return child
 
     def _nest_donepat(self, nonce):
-        return re.compile(rb"\nNRBNEST" + nonce.encode() + rb":(\d+)\n")
+        return re.compile(br"\nNRBNEST" + nonce.encode() + br":(\d+)\n")
 
     def nest_open(self, host, ssh="ssh", ssh_opts=(), remote_python="python3", remote_path=None):
         """Type the shell command that puts this pty in raw mode and execs `ssh host ...`
@@ -512,8 +580,8 @@ class NewroleSession:
         (so the caller can safely start writing handshake bytes next) and returns the marker
         nonce to watch for when that ssh job finishes."""
         argv = [ssh, "-T"] + list(ssh_opts) + ["--", host, remote_command(remote_python, remote_path)]
-        cmdline = " ".join(shlex.quote(a) for a in argv)
-        nonce = base64.b16encode(os.urandom(8)).decode().lower()
+        cmdline = " ".join(shquote(a) for a in argv)
+        nonce = str(base64.b16encode(os.urandom(8)).decode().lower())
         # set +e: a nonzero ssh exit must never skip our completion marker, even if the
         # user's shell has `set -e` active. We restore -echo -onlcr (this session's own
         # standing settings, set once in start() and otherwise never touched) rather than
@@ -526,8 +594,8 @@ class NewroleSession:
         self._write(line.encode())
         # Wait for the READY marker: confirms raw mode is active and we're about to exec ssh,
         # so nest_handshake()'s writes can never land on the ordinary canonical/echoing prompt.
-        readypat = re.compile(re.escape(("NRBNESTREADY" + nonce).encode()) + rb"\r?\n")
-        deadline = time.monotonic() + 10.0
+        readypat = re.compile(re.escape(("NRBNESTREADY" + nonce).encode()) + br"\r?\n")
+        deadline = monotonic() + 10.0
         while True:
             m = readypat.search(self.buf)
             if m:
@@ -556,7 +624,7 @@ class NewroleSession:
 
     def nest_read_event(self, nonce, deadline):
         """Read one JSON line from the nested child (its 'ready'/'error', or a command
-        reply) — or raise if the nested ssh job ends first (e.g. connection refused)."""
+        reply) -- or raise if the nested ssh job ends first (e.g. connection refused)."""
         donepat = self._nest_donepat(nonce)
         while True:
             m = donepat.search(self.buf)
@@ -578,7 +646,7 @@ class NewroleSession:
                     continue      # stray ssh/bash banner line before the real JSON
                 if isinstance(obj, dict):
                     return obj
-            if deadline is not None and time.monotonic() > deadline:
+            if deadline is not None and monotonic() > deadline:
                 raise NewroleError("timed out waiting for nested session")
             if not self._wait_readable(deadline):
                 raise NewroleError("timed out waiting for nested session")
@@ -598,15 +666,15 @@ class NewroleSession:
         """Discard everything until the nested job's completion marker (used on error, or
         after sending it a close, when we don't care about anything it still prints)."""
         donepat = self._nest_donepat(nonce)
-        deadline = time.monotonic() + timeout
+        deadline = monotonic() + timeout
         while True:
             m = donepat.search(self.buf)
             if m:
                 del self.buf[:m.end()]
-                return int(m.group(1))
+                return int(bytes(m.group(1)))
             if len(self.buf) > 4096:
                 del self.buf[:len(self.buf) - 2048]
-            if time.monotonic() > deadline:
+            if monotonic() > deadline:
                 raise NewroleError("nested session did not close within %ss" % timeout)
             if not self._wait_readable(deadline):
                 raise NewroleError("nested session did not close within %ss" % timeout)
@@ -618,14 +686,11 @@ class NewroleSession:
         controller talking to A can drive B's JSON protocol transparently through A's pty.
         Returns the nested ssh job's exit status.
 
-        `rd` is a buffered io.BufferedReader (serve()'s stdin): earlier rd.readline() calls
-        may have pulled more bytes out of the kernel pipe than they returned, leaving extra
-        bytes sitting in rd's own internal buffer where select()/read on the raw fd can't see
-        them. rd.peek() drains that safely (it never blocks and never signals EOF either way,
-        so an empty peek() is not meaningful on its own). Once the buffer is confirmed empty,
-        select() on the raw fd is used to tell "no data yet" apart from real EOF/data before
-        read1() (on a non-blocking fd, both an empty pipe *and* EOF return b'' from read1() --
-        they're only distinguishable by asking select() first).
+        `rd` is serve()'s LineReader: earlier rd.readline() calls may have pulled more bytes
+        out of the kernel pipe than they returned, leaving them in its own buffer where
+        select() on the raw fd can't see them, so rd.take() drains those first. Afterwards
+        select() on the raw fd distinguishes "no data yet" from data/EOF (readable + empty
+        read = EOF).
 
         B's JSON replies must reach the controller promptly and whole (it reads them with
         readline()), so every byte confirmed not to be part of the completion marker is
@@ -640,60 +705,54 @@ class NewroleSession:
         """
         donepat = self._nest_donepat(nonce)
         mark = ("\nNRBNEST" + nonce).encode()
-        rfd = rd.fileno()
-        flags = fcntl.fcntl(rfd, fcntl.F_GETFL)
-        fcntl.fcntl(rfd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        rfd = rd.fd
         held_since = None
-        try:
-            while True:
-                pending = rd.peek(65536)
-                if pending:
-                    self._write(rd.read(len(pending)))
-                    continue
-                r, _, _ = select.select([self.fd, rfd], [], [], 0.2)
-                if rfd in r:
-                    chunk = rd.read1(65536)
-                    if chunk == b"":
-                        raise SessionDead("controller disconnected while nested")
-                    if chunk:
-                        self._write(chunk)
-                if self.fd in r:
-                    self._pump()
-                    m = donepat.search(self.buf)
-                    if m:
-                        if m.start():
-                            outb.write(bytes(self.buf[:m.start()]))
-                        rc = int(m.group(1))
-                        del self.buf[:m.end()]
-                        outb.flush()
-                        return rc
-                # No full marker: flush everything except a trailing suffix that could still
-                # grow into one (longest overlap with the marker's own start, checked longest
-                # first) -- unless that held-back tail has sat unchanged for a moment, in which
-                # case nothing is actually still arriving to complete it, so flush it too.
-                buf = bytes(self.buf)
-                keep = 0
-                for n in range(min(len(buf), len(mark)), 0, -1):
-                    if buf[-n:] == mark[:n]:
-                        keep = n
-                        break
-                if keep and held_since is None:
-                    held_since = time.monotonic()
-                elif not keep:
-                    held_since = None
-                if keep and held_since is not None and time.monotonic() - held_since > 0.3:
-                    keep = 0
-                    held_since = None
-                if len(buf) > keep:
-                    cut = len(buf) - keep
-                    outb.write(buf[:cut])
-                    del self.buf[:cut]
+        while True:
+            pending = rd.take()
+            if pending:
+                self._write(pending)
+                continue
+            r, _, _ = select_retry([self.fd, rfd], [], [], 0.2)
+            if rfd in r:
+                chunk = os.read(rfd, 65536)
+                if chunk == b"":
+                    raise SessionDead("controller disconnected while nested")
+                self._write(chunk)
+            if self.fd in r:
+                self._pump()
+                m = donepat.search(self.buf)
+                if m:
+                    if m.start():
+                        outb.write(bytes(self.buf[:m.start()]))
+                    rc = int(bytes(m.group(1)))
+                    del self.buf[:m.end()]
                     outb.flush()
-        finally:
-            fcntl.fcntl(rfd, fcntl.F_SETFL, flags)
+                    return rc
+            # No full marker: flush everything except a trailing suffix that could still
+            # grow into one (longest overlap with the marker's own start, checked longest
+            # first) -- unless that held-back tail has sat unchanged for a moment, in which
+            # case nothing is actually still arriving to complete it, so flush it too.
+            buf = bytes(self.buf)
+            keep = 0
+            for n in range(min(len(buf), len(mark)), 0, -1):
+                if buf[-n:] == mark[:n]:
+                    keep = n
+                    break
+            if keep and held_since is None:
+                held_since = monotonic()
+            elif not keep:
+                held_since = None
+            if keep and held_since is not None and monotonic() - held_since > 0.3:
+                keep = 0
+                held_since = None
+            if len(buf) > keep:
+                cut = len(buf) - keep
+                outb.write(buf[:cut])
+                del self.buf[:cut]
+                outb.flush()
 
 
-class NestedSession:
+class NestedSession(object):
     """A newrole session on a second host, opened in-process by running `ssh` inside the
     role shell of an already-authenticated NewroleSession (the jump/bastion pattern). Same
     run()/close() interface as NewroleSession and RemoteSession."""
@@ -717,7 +776,7 @@ class NestedSession:
                                            self.remote_python, self.remote_path)
         self.parent.nest_handshake(self.cfg, self.password, script_b64)
         try:
-            ev = self.parent.nest_read_event(self.nonce, time.monotonic() + self.auth_timeout)
+            ev = self.parent.nest_read_event(self.nonce, monotonic() + self.auth_timeout)
         except NestEnded:
             raise
         except NewroleError:
@@ -740,9 +799,9 @@ class NestedSession:
         if not self._open:
             raise SessionDead("nested session not started")
         req = {"cmd": cmd, "timeout": timeout, "isolate": isolate, "stderr": stderr,
-               "answers": [[r, pw if isinstance(pw, str) else pw.decode()] for r, pw in (answers or [])]}
+               "answers": [[r, to_json_text(pw)] for r, pw in (answers or [])]}
         self.parent.nest_send(req)
-        deadline = time.monotonic() + (timeout + 10 if timeout else 3600)
+        deadline = monotonic() + (timeout + 10 if timeout else 3600)
         r = self.parent.nest_read_event(self.nonce, deadline)
         if r.get("event") == "error":
             raise_event_error(r)
@@ -770,7 +829,7 @@ class NestedSession:
 # -------------------------------------------------------------------- remote
 
 
-class RemoteSession:
+class RemoteSession(object):
     """Same run() interface, but the NewroleSession lives on an ssh target."""
 
     def __init__(self, host, cfg, password, ssh="ssh", ssh_opts=(), remote_python="python3", remote_path=None,
@@ -803,13 +862,13 @@ class RemoteSession:
                 w.write(json.dumps(self.cfg).encode() + b"\n")
                 w.write(line)
                 w.flush()
-            except OSError:                 # ssh already exited (refused, unreachable, bad key...)
+            except _IOERRORS:               # ssh already exited (refused, unreachable, bad key...)
                 raise SessionDead("ssh exited (status %s) before login; see its message above"
                                   % self._finish())
             finally:
                 wipe(line)
                 wipe(self.password)
-            ev = self._read(time.monotonic() + self.cfg.get("auth_timeout", 30.0) + 30.0)
+            ev = self._read(monotonic() + self.cfg.get("auth_timeout", 30.0) + 30.0)
             if ev.get("event") == "error":
                 raise_event_error(ev)
             if ev.get("event") != "ready":
@@ -828,13 +887,13 @@ class RemoteSession:
         fd = self.proc.stdout.fileno()
         while b"\n" not in self._rbuf:
             if deadline is not None:
-                left = deadline - time.monotonic()
-                if left <= 0 or not select.select([fd], [], [], left)[0]:
+                left = deadline - monotonic()
+                if left <= 0 or not select_retry([fd], [], [], left)[0]:
                     raise CommandTimeout("no reply from remote within the allowed time")
             chunk = os.read(fd, 65536)
             if not chunk:
                 line = bytes(self._rbuf)
-                self._rbuf.clear()
+                del self._rbuf[:]
                 return line
             self._rbuf += chunk
         i = self._rbuf.index(b"\n") + 1
@@ -856,15 +915,15 @@ class RemoteSession:
         if self.proc is None or self.proc.poll() is not None:
             raise SessionDead("session not started or already terminated")
         req = {"cmd": cmd, "timeout": timeout, "isolate": isolate, "stderr": stderr,
-               "answers": [[r, pw if isinstance(pw, str) else pw.decode()] for r, pw in (answers or [])]}
+               "answers": [[r, to_json_text(pw)] for r, pw in (answers or [])]}
         try:
             self.proc.stdin.write(json.dumps(req).encode() + b"\n")
             self.proc.stdin.flush()
-        except (OSError, ValueError):
+        except _IOERRORS + (ValueError,):
             raise SessionDead("remote connection lost")
         # the remote enforces `timeout` itself; this is only a backstop for a hung connection
         try:
-            r = self._read(time.monotonic() + timeout + REPLY_GRACE if timeout else None)
+            r = self._read(monotonic() + timeout + REPLY_GRACE if timeout else None)
         except CommandTimeout:
             # the late reply would otherwise be taken for the answer to the next command
             self._finish()
@@ -875,7 +934,7 @@ class RemoteSession:
 
     def nest(self, host, cfg, password, ssh="ssh", ssh_opts=(), remote_python="python3", remote_path=None):
         """Open a newrole session on a second host `host`, reached by running `ssh` *inside
-        this session's own role shell* on its host — the same ssh-A/newrole/ssh-B/newrole
+        this session's own role shell* on its host -- the same ssh-A/newrole/ssh-B/newrole
         sequence as NewroleSession.nest(), just driven through this connection's pipe instead
         of a local pty. Returns a RemoteSession sharing the same ssh connection; only one may
         be open at a time (nest the returned session again for a third hop)."""
@@ -896,11 +955,11 @@ class RemoteSession:
             w.write(line)
             w.flush()
             wipe(line)
-        except (BrokenPipeError, OSError):
+        except _IOERRORS:
             raise SessionDead("remote connection lost")
         finally:
             wipe(pw)
-        ev = self._read(time.monotonic() + cfg.get("auth_timeout", 30.0) + 30.0)
+        ev = self._read(monotonic() + cfg.get("auth_timeout", 30.0) + 30.0)
         if ev.get("event") == "error":
             raise_event_error(ev)
         if ev.get("event") != "ready":
@@ -913,14 +972,16 @@ class RemoteSession:
     def _finish(self):
         try:
             self.proc.stdin.close()
-        except OSError:
+        except _IOERRORS:
             pass
-        try:
-            return self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        end = monotonic() + 10
+        while self.proc.poll() is None and monotonic() < end:     # Popen.wait(timeout=) is py3-only
+            time.sleep(0.01)
+        if self.proc.poll() is None:
             self.proc.kill()
             self.proc.wait()
             return -1
+        return self.proc.returncode
 
     def close(self):
         if self._nested_child is not None:
@@ -929,7 +990,7 @@ class RemoteSession:
             try:
                 self.proc.stdin.write(b'{"op":"close"}\n')
                 self.proc.stdin.flush()
-            except OSError:
+            except _IOERRORS:
                 pass
             self._finish()
 
@@ -947,7 +1008,7 @@ class _NestedRemote(RemoteSession):
     buffer). Returned by RemoteSession.nest(); already started, closed by "unnest"."""
 
     def __init__(self, parent, host, cfg, ssh, ssh_opts, remote_python, remote_path, context):
-        super().__init__(host, cfg, b"", ssh, ssh_opts, remote_python, remote_path)
+        super(_NestedRemote, self).__init__(host, cfg, b"", ssh, ssh_opts, remote_python, remote_path)
         wipe(self.password)
         self.proc, self._rbuf, self._parent = parent.proc, parent._rbuf, parent
         self.context = context
@@ -962,17 +1023,18 @@ class _NestedRemote(RemoteSession):
         try:
             self.proc.stdin.write(b'{"op":"unnest"}\n')
             self.proc.stdin.flush()
-            deadline = time.monotonic() + 15.0
+            deadline = monotonic() + 15.0
             while self._read(deadline).get("event") != "unnested":
                 pass
-        except (NewroleError, OSError, ValueError):
+        except (NewroleError, ValueError) + _IOERRORS:
             pass
         self._parent._nested_child = None
 
 
 def serve():
     """Remote end: stdin is a binary pipe; stdout carries JSON lines only."""
-    rd, out = sys.stdin.buffer, sys.stdout
+    rd, out = LineReader(0), sys.stdout
+    outb = getattr(out, "buffer", out)
 
     def emit(o):
         out.write(json.dumps(o) + "\n")
@@ -1022,7 +1084,7 @@ def serve():
                     ncfg = json.loads(rd.readline().decode())
                     npw = bytearray(rd.readline().rstrip(b"\r\n"))
                     sess.nest_handshake(ncfg, npw, script_b64)
-                    ev = sess.nest_read_event(nonce, time.monotonic() + float(ncfg.get("auth_timeout", 30.0)))
+                    ev = sess.nest_read_event(nonce, monotonic() + float(ncfg.get("auth_timeout", 30.0)))
                 except Exception as e:
                     if nonce is not None and not isinstance(e, NestEnded):
                         sess.nest_abort(nonce)
@@ -1039,7 +1101,7 @@ def serve():
                         pass
                     continue
                 out.flush()
-                rc = sess.nest_proxy(rd, sys.stdout.buffer, nonce)
+                rc = sess.nest_proxy(rd, outb, nonce)
                 emit({"event": "unnested", "rc": rc})
                 continue
             try:
@@ -1080,9 +1142,9 @@ def _read_password(a, role):
             data += c
         return bytearray(data.rstrip(b"\r\n"))
     if a.password_stdin:
-        return bytearray(sys.stdin.buffer.readline().rstrip(b"\r\n"))
+        return bytearray(getattr(sys.stdin, "buffer", sys.stdin).readline().rstrip(b"\r\n"))
     try:
-        return bytearray(getpass.getpass("newrole password (role %s): " % role).encode())
+        return bytearray(to_bytes(getpass.getpass("newrole password (role %s): " % role)))
     except EOFError:
         raise UsageError("no password source and no terminal to prompt on; "
                          "use --password-file, --password-fd or --password-stdin")
@@ -1186,7 +1248,7 @@ def main(argv=None):
     except UsageError as e:
         sys.stderr.write("newrole-batch: %s\n" % e)
         return EXIT_USAGE
-    except OSError as e:
+    except _IOERRORS as e:
         sys.stderr.write("newrole-batch: %s: %s\n" % (e.filename, e.strerror))
         return EXIT_USAGE
     except KeyboardInterrupt:

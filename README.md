@@ -1,8 +1,11 @@
 # newrole-batch
 
 Run many commands in an SELinux role that requires `newrole` + a PAM password prompt,
-authenticating **once** per batch. Single file, Python ≥ 3.6, **standard library only**
-(nothing to download or vendor; works on the stock el7 and el9 `python3`).
+authenticating **once** per batch. Single file, **Python 2.7 or ≥ 3.6**, **standard library only**
+(nothing to download or vendor; works on the stock el7 `python`/`python3` and el9 `python3`).
+The controller and the ssh target may run different versions (e.g. a Python 3 workstation driving a
+target that only has 2.7.5: pass `--remote-python python`). The script stays ASCII and
+py2/py3-compatible because it is `exec`ed on the target.
 
 ## Use
 

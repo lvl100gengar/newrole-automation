@@ -330,3 +330,14 @@ def test_real_nesting(real, secrets, make_session):
         finally:
             if helper:
                 a.run("rm -rf '%s'" % helper)
+
+
+def test_source_is_ascii_and_py2_safe():
+    """The file is exec()ed on targets that may only have python 2.7: no non-ASCII source, no
+    py3-only constructs that cannot even be parsed there."""
+    with open(nb.__file__.replace(".pyc", ".py"), "rb") as f:
+        src = f.read()
+    src.decode("ascii")
+    for banned in (b"super()", b"sys.stdin.buffer", b"BlockingIOError", b"ChildProcessError", b"BrokenPipeError",
+                   b" rb\"", b"(rb\"", b".clear()", b"time.monotonic()", b"shlex.quote"):
+        assert banned not in src, banned

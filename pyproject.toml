@@ -4,11 +4,12 @@ addopts = "-p no:cacheprovider"
 
 [tool.ruff]
 line-length = 120
-target-version = "py37"          # the code itself still runs on 3.6 (RHEL 7 targets)
+target-version = "py37"          # newrole_batch.py itself must still run on 2.7.5 and 3.6 (RHEL 7 targets)
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP", "SIM", "RUF"]
 ignore = [
+    "UP008", "UP024", "UP004",   # py2 compat: super(Class, self), (OSError, IOError), explicit object base
     "UP031",   # %-formatting is used to build shell text, where "%%" escapes matter
     "UP032",   # ...same for .format()/f-string suggestions
     "SIM105",  # contextlib.suppress would add an import to the streamed single-file script

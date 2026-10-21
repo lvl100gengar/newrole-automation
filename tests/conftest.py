@@ -75,6 +75,7 @@ class Real:
         self.extra_ssh_opts = shlex.split(e("NRB_SSH_OPTS", ""))
         self.nest_host = e("NRB_NEST_HOST")
         self.nest_key = e("NRB_NEST_KEY")       # path ON the target; omit for password auth
+        self.remote_python = e("NRB_REMOTE_PYTHON", "python3")   # interpreter on the target
         self.allow_lockout = e("NRB_ALLOW_LOCKOUT") == "1"
 
     def get_password(self):
@@ -156,7 +157,7 @@ def make_session(request, tmp_path, monkeypatch):
         opts, env = ssh_args(secrets)
         return nb.RemoteSession(REAL.target, dict(cfg, role=REAL.role),
                                 bytearray(password or REAL.get_password()),
-                                ssh_opts=opts, ssh_env=env)
+                                ssh_opts=opts, ssh_env=env, remote_python=REAL.remote_python)
     return make
 
 
